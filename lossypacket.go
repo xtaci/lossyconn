@@ -121,13 +121,31 @@ func (lp *LossyPacket) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		return 0, errors.New("not connected")
 	}
 
-	// packets drop based on loss rate
+	// close
+	select {
+	case <-lp.die:
+		return 0, errors.New("broken pipe")
+	default:
+	}
+
+	// timeout
+	if d, ok := lp.wtDeadLine.Load().(time.Time); ok && !d.IsZero() {
+		if time.Now().After(d) {
+			return 0, errors.New("i/o timeout")
+		}
+	}
+
+	// drop
 	if mrand.Intn(100) < lp.loss {
 		return len(p), nil
 	}
 
+	// copy
 	c := make([]byte, len(p))
 	copy(c, p)
+
+	// delay
+	<-time.After(time.Duration(lp.delay) * time.Millisecond)
 
 	lp.peer.mu.Lock()
 	lp.peer.rx = append(lp.peer.rx, c)
