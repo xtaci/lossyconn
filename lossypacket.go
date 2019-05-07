@@ -12,12 +12,45 @@ import (
 	"time"
 )
 
+var packetConns *PacketConns
+
+func init() {
+	packetConns = NewPacketConns()
+}
+
+type PacketConns struct {
+	conns map[string]*LossyPacketConn
+	mu    sync.Mutex
+}
+
+func NewPacketConns() *PacketConns {
+	pcs := new(PacketConns)
+	pcs.conns = make(map[string]*LossyPacketConn)
+	return pcs
+}
+
+func (pcs *PacketConns) Get(addr string) *LossyPacketConn {
+	pcs.mu.Lock()
+	defer pcs.mu.Unlock()
+	return pcs.conns[addr]
+}
+
+func (pcs *PacketConns) Set(conn *LossyPacketConn) {
+	pcs.mu.Lock()
+	defer pcs.mu.Unlock()
+	pcs.conns[conn.LocalAddr().String()] = conn
+}
+
+type Packet struct {
+	addr    net.Addr
+	payload []byte
+}
+
 // LossPacket implements a net.PacketConn with a given loss rate for sending
-type LossyPacket struct {
+type LossyPacketConn struct {
 	loss  int
 	delay int
-	rx    [][]byte
-	peer  *LossyPacket
+	rx    []Packet
 	addr  net.Addr
 
 	die             chan struct{}
@@ -28,42 +61,42 @@ type LossyPacket struct {
 }
 
 type Address struct {
-	network string
-	str     string
+	str string
 }
 
 func NewAddress() *Address {
 	addr := new(Address)
-	addr.network = "lossy"
 	fakeaddr := make([]byte, 16)
 	io.ReadFull(rand.Reader, fakeaddr)
 	addr.str = fmt.Sprintf("%s", fakeaddr)
 	return addr
 }
 
-// NewLossyPacket create a loss connection with loss rate and latency
+func (addr *Address) Network() string {
+	return "lossy"
+}
+func (addr *Address) String() string {
+	return addr.str
+}
+
+// NewLossyPacketConn create a loss connection with loss rate and latency
 // loss must be between [0,1]
 // delay is time in millisecond
-func NewLossyPacket(loss float32, delay int) (*LossyPacket, error) {
+func NewLossyPacketConn(loss float32, delay int) (*LossyPacketConn, error) {
 	if loss < 0 || loss > 1 {
 		return nil, errors.New("loss must be in [0,1]")
 	}
 
-	lp := new(LossyPacket)
+	lp := new(LossyPacketConn)
 	lp.loss = int(loss * 100)
 	lp.delay = delay
 	lp.chNotifyReaders = make(chan struct{}, 1)
 	lp.die = make(chan struct{})
+	lp.addr = NewAddress()
 	return lp, nil
 }
 
-// connect 2 loss packet connection
-func ConnectLossyPacketConn(left *LossyPacket, right *LossyPacket) {
-	left.peer = right
-	right.peer = left
-}
-
-func (lp *LossyPacket) notifyReaders() {
+func (lp *LossyPacketConn) notifyReaders() {
 	select {
 	case lp.chNotifyReaders <- struct{}{}:
 	default:
@@ -80,15 +113,14 @@ func (lp *LossyPacket) notifyReaders() {
 // ReadFrom can be made to time out and return
 // an Error with Timeout() == true after a fixed time limit;
 // see SetDeadline and SetReadDeadline.
-func (lp *LossyPacket) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+func (lp *LossyPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 RETRY:
 	lp.mu.Lock()
 
 	if lp.rx != nil {
-		n = copy(p, lp.rx[0])
+		n = copy(p, lp.rx[0].payload)
+		addr = lp.rx[0].addr
 		lp.rx = lp.rx[1:]
-		addr = lp.peer.addr
-		err = nil
 		lp.mu.Unlock()
 		return
 	}
@@ -116,11 +148,7 @@ RETRY:
 // an Error with Timeout() == true after a fixed time limit;
 // see SetDeadline and SetWriteDeadline.
 // On packet-oriented connections, write timeouts are rare.
-func (lp *LossyPacket) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	if lp.peer == nil {
-		return 0, errors.New("not connected")
-	}
-
+func (lp *LossyPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	// close
 	select {
 	case <-lp.die:
@@ -140,24 +168,23 @@ func (lp *LossyPacket) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		return len(p), nil
 	}
 
-	// copy
-	c := make([]byte, len(p))
-	copy(c, p)
-
-	// delay
-	<-time.After(time.Duration(lp.delay) * time.Millisecond)
-
-	lp.peer.mu.Lock()
-	lp.peer.rx = append(lp.peer.rx, c)
-	lp.peer.mu.Unlock()
-	lp.peer.notifyReaders()
-
+	if remote := packetConns.Get(addr.String()); remote != nil {
+		// copy
+		c := make([]byte, len(p))
+		copy(c, p)
+		// delay
+		<-time.After(time.Duration(lp.delay) * time.Millisecond)
+		remote.mu.Lock()
+		remote.rx = append(remote.rx, Packet{lp.LocalAddr(), c})
+		remote.mu.Unlock()
+		remote.notifyReaders()
+	}
 	return len(p), nil
 }
 
 // Close closes the connection.
 // Any blocked ReadFrom or WriteTo operations will be unblocked and return errors.
-func (lp *LossyPacket) Close() error {
+func (lp *LossyPacketConn) Close() error {
 	lp.mu.Lock()
 	defer lp.mu.Unlock()
 
@@ -171,7 +198,7 @@ func (lp *LossyPacket) Close() error {
 }
 
 // LocalAddr returns the local network address.
-func (lp *LossyPacket) LocalAddr() net.Addr { return lp.addr }
+func (lp *LossyPacketConn) LocalAddr() net.Addr { return lp.addr }
 
 // SetDeadline sets the read and write deadlines associated
 // with the connection. It is equivalent to calling both
@@ -188,7 +215,7 @@ func (lp *LossyPacket) LocalAddr() net.Addr { return lp.addr }
 // the deadline after successful ReadFrom or WriteTo calls.
 //
 // A zero value for t means I/O operations will not time out.
-func (lp *LossyPacket) SetDeadline(t time.Time) error {
+func (lp *LossyPacketConn) SetDeadline(t time.Time) error {
 	lp.rdDeadLine.Store(t)
 	lp.wtDeadLine.Store(t)
 	return nil
@@ -197,7 +224,7 @@ func (lp *LossyPacket) SetDeadline(t time.Time) error {
 // SetReadDeadline sets the deadline for future ReadFrom calls
 // and any currently-blocked ReadFrom call.
 // A zero value for t means ReadFrom will not time out.
-func (lp *LossyPacket) SetReadDeadline(t time.Time) error {
+func (lp *LossyPacketConn) SetReadDeadline(t time.Time) error {
 	lp.rdDeadLine.Store(t)
 	return nil
 }
@@ -207,7 +234,7 @@ func (lp *LossyPacket) SetReadDeadline(t time.Time) error {
 // Even if write times out, it may return n > 0, indicating that
 // some of the data was successfully written.
 // A zero value for t means WriteTo will not time out.
-func (lp *LossyPacket) SetWriteDeadline(t time.Time) error {
+func (lp *LossyPacketConn) SetWriteDeadline(t time.Time) error {
 	lp.wtDeadLine.Store(t)
 	return nil
 }
