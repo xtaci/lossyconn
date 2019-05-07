@@ -41,25 +41,6 @@ func (pcs *PacketConns) Set(conn *LossyPacketConn) {
 	pcs.conns[conn.LocalAddr().String()] = conn
 }
 
-type Packet struct {
-	addr    net.Addr
-	payload []byte
-}
-
-// LossPacket implements a net.PacketConn with a given loss rate for sending
-type LossyPacketConn struct {
-	loss  int
-	delay int
-	rx    []Packet
-	addr  net.Addr
-
-	die             chan struct{}
-	mu              sync.Mutex
-	rdDeadLine      atomic.Value
-	wtDeadLine      atomic.Value
-	chNotifyReaders chan struct{}
-}
-
 type Address struct {
 	str string
 }
@@ -79,10 +60,32 @@ func (addr *Address) String() string {
 	return addr.str
 }
 
+type Packet struct {
+	addr    net.Addr
+	payload []byte
+}
+
+// LossPacket implements a net.PacketConn with a given loss rate for sending
+type LossyPacketConn struct {
+	loss  int
+	delay int
+
+	deviation atomic.Value // delay deviation
+
+	rx   []Packet
+	addr net.Addr
+
+	die             chan struct{}
+	mu              sync.Mutex
+	rdDeadLine      atomic.Value
+	wtDeadLine      atomic.Value
+	chNotifyReaders chan struct{}
+}
+
 // NewLossyPacketConn create a loss connection with loss rate and latency
 // loss must be between [0,1]
 // delay is time in millisecond
-func NewLossyPacketConn(loss float32, delay int) (*LossyPacketConn, error) {
+func NewLossyPacketConn(loss float64, delay int) (*LossyPacketConn, error) {
 	if loss < 0 || loss > 1 {
 		return nil, errors.New("loss must be in [0,1]")
 	}
@@ -95,6 +98,9 @@ func NewLossyPacketConn(loss float32, delay int) (*LossyPacketConn, error) {
 	lp.addr = NewAddress()
 	return lp, nil
 }
+
+// SetDelayDeviation sets the deviation for delays, delay is the median value
+func (lp *LossyPacketConn) SetDelayDeviation(deviation float64) { lp.deviation.Store(deviation) }
 
 func (lp *LossyPacketConn) notifyReaders() {
 	select {
@@ -157,10 +163,11 @@ func (lp *LossyPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	}
 
 	// timeout
+	var deadline <-chan time.Time
 	if d, ok := lp.wtDeadLine.Load().(time.Time); ok && !d.IsZero() {
-		if time.Now().After(d) {
-			return 0, errors.New("i/o timeout")
-		}
+		timer := time.NewTimer(time.Until(d))
+		defer timer.Stop()
+		deadline = timer.C
 	}
 
 	// drop
@@ -173,7 +180,12 @@ func (lp *LossyPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		c := make([]byte, len(p))
 		copy(c, p)
 		// delay
-		<-time.After(time.Duration(lp.delay) * time.Millisecond)
+		delay := float64(lp.delay) + lp.deviation.Load().(float64)*mrand.NormFloat64()
+		select {
+		case <-time.After(time.Duration(delay * float64(time.Millisecond))):
+		case <-deadline:
+			return 0, errors.New("i/o timeout")
+		}
 		remote.mu.Lock()
 		remote.rx = append(remote.rx, Packet{lp.LocalAddr(), c})
 		remote.mu.Unlock()
