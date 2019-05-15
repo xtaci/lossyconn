@@ -80,6 +80,10 @@ type LossyPacketConn struct {
 	rdDeadLine      atomic.Value
 	wtDeadLine      atomic.Value
 	chNotifyReaders chan struct{}
+
+	// stats
+	drop int
+	sent int
 }
 
 // NewLossyPacketConn create a loss connection with loss rate and latency
@@ -172,6 +176,7 @@ func (lp *LossyPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 	// drop
 	if mrand.Intn(100) < lp.loss {
+		lp.drop++
 		return len(p), nil
 	}
 
