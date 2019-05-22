@@ -1,6 +1,9 @@
 package lossyconn
 
-import "testing"
+import (
+	"log"
+	"testing"
+)
 
 func TestLossyPacket(t *testing.T) {
 	left, err := NewLossyPacketConn(0.3, 200)
@@ -15,4 +18,8 @@ func TestLossyPacket(t *testing.T) {
 
 	p := make([]byte, 1024)
 	left.WriteTo(p, right.LocalAddr())
+	right.ReadFrom(p)
+
+	log.Printf("left:%v\n", left)
+	log.Printf("right:%v\n", right)
 }
