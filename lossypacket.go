@@ -124,7 +124,7 @@ func (conn *LossyPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error
 RETRY:
 	conn.mu.Lock()
 
-	if conn.rx != nil {
+	if len(conn.rx) > 0 {
 		n = copy(p, conn.rx[0].payload)
 		addr = conn.rx[0].addr
 		conn.rx = conn.rx[1:]
@@ -176,10 +176,10 @@ func (conn *LossyPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error)
 		conn.delayedWriter.Send(remote, Packet{conn.LocalAddr(), p1, time.Now()}, time.Duration(delay)*time.Millisecond)
 		atomic.AddUint32(&conn.sSent, 1)
 		atomic.AddUint32(&conn.sBytesSent, uint32(len(p)))
+		return len(p), nil
 	} else {
 		return 0, io.ErrUnexpectedEOF
 	}
-	return len(p), nil
 }
 
 // Close closes the connection.
