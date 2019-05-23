@@ -4,11 +4,11 @@
 package lossyconn
 
 import (
-	"crypto/rand"
+	crand "crypto/rand"
 	"errors"
 	"fmt"
 	"io"
-	mrand "math/rand"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -24,7 +24,7 @@ type Address struct {
 func NewAddress() *Address {
 	addr := new(Address)
 	fakeaddr := make([]byte, 16)
-	io.ReadFull(rand.Reader, fakeaddr)
+	io.ReadFull(crand.Reader, fakeaddr)
 	addr.str = fmt.Sprintf("%s", fakeaddr)
 	return addr
 }
@@ -59,6 +59,8 @@ type LossyConn struct {
 	wtDeadLine      atomic.Value  // write deadline
 	chNotifyReaders chan struct{} // notify incoming packets
 
+	rng *rand.Rand
+
 	// timed sender
 	sender *TimedSender
 
@@ -68,6 +70,7 @@ type LossyConn struct {
 	sReceived      uint32
 	sBytesSent     uint32
 	sBytesReceived uint32
+	sMaxDelay      int64
 }
 
 // NewLossyConn create a loss connection with loss rate and latency
@@ -88,6 +91,7 @@ func NewLossyConn(loss float64, delay int) (*LossyConn, error) {
 	conn.addr = NewAddress()
 	conn.deviation.Store(float64(1.0))
 	conn.sender = NewDelayedWriter()
+	conn.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	defaultConnectionManager.Set(conn)
 	return conn, nil
 }
@@ -112,6 +116,18 @@ func (conn *LossyConn) receivePacket(packet Packet) {
 	conn.notifyReaders()
 	atomic.AddUint32(&conn.sReceived, 1)
 	atomic.AddUint32(&conn.sBytesReceived, uint32(len(packet.payload)))
+	delay := time.Now().Sub(packet.ts)
+	if time.Now().Sub(packet.ts) > time.Duration(atomic.LoadInt64(&conn.sMaxDelay)) {
+		atomic.StoreInt64(&conn.sMaxDelay, int64(delay))
+	}
+}
+
+// Implementation of the Conn interface.
+
+// Read implements the Conn Read method.
+func (conn *LossyConn) Read(b []byte) (int, error) {
+	n, _, err := conn.ReadFrom(b)
+	return n, err
 }
 
 // ReadFrom reads a packet from the connection,
@@ -154,6 +170,11 @@ RETRY:
 	}
 }
 
+// Write implements the Conn Write method.
+func (conn *LossyConn) Write(p []byte) (n int, err error) {
+	return 0, io.ErrNoProgress
+}
+
 // WriteTo writes a packet with payload p to addr.
 // WriteTo can be made to time out and return
 // an Error with Timeout() == true after a fixed time limit;
@@ -168,7 +189,7 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	}
 
 	// drop
-	if mrand.Intn(100) < conn.loss {
+	if conn.rng.Intn(100) < conn.loss {
 		atomic.AddUint32(&conn.sDrop, 1)
 		return len(p), nil
 	}
@@ -176,7 +197,7 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if remote := defaultConnectionManager.Get(addr.String()); remote != nil {
 		p1 := make([]byte, len(p))
 		copy(p1, p)
-		delay := float64(conn.delay) + conn.deviation.Load().(float64)*mrand.NormFloat64()
+		delay := float64(conn.delay) + conn.deviation.Load().(float64)*rand.NormFloat64()
 		conn.sender.Send(remote, Packet{conn.LocalAddr(), p1, time.Now()}, time.Duration(delay)*time.Millisecond)
 		atomic.AddUint32(&conn.sSent, 1)
 		atomic.AddUint32(&conn.sBytesSent, uint32(len(p)))
@@ -203,6 +224,9 @@ func (conn *LossyConn) Close() error {
 
 // LocalAddr returns the local network address.
 func (conn *LossyConn) LocalAddr() net.Addr { return conn.addr }
+
+// RemoteAddr returns the remote network address.
+func (conn *LossyConn) RemoteAddr() net.Addr { return nil }
 
 // SetDeadline sets the read and write deadlines associated
 // with the connection. It is equivalent to calling both
@@ -244,11 +268,12 @@ func (conn *LossyConn) SetWriteDeadline(t time.Time) error {
 }
 
 func (conn *LossyConn) String() string {
-	return fmt.Sprintf("packet dropped:%v packet sent:%v packet received:%v tx bytes:%v rx bytes:%v",
+	return fmt.Sprintf("packet dropped:%v packet sent:%v packet received:%v tx bytes:%v rx bytes:%v max delay:%v",
 		atomic.LoadUint32(&conn.sDrop),
 		atomic.LoadUint32(&conn.sSent),
 		atomic.LoadUint32(&conn.sReceived),
 		atomic.LoadUint32(&conn.sBytesSent),
 		atomic.LoadUint32(&conn.sBytesReceived),
+		time.Duration(atomic.LoadInt64(&conn.sMaxDelay)),
 	)
 }
