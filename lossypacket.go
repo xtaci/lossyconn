@@ -45,23 +45,24 @@ type Packet struct {
 
 // LossPacket implements a net.PacketConn with a given loss rate for sending
 type LossyPacketConn struct {
-	loss  int
-	delay int
+	die chan struct{}
+	mu  sync.Mutex
 
+	loss      int          // loss rate [0, 100]
+	delay     int          // mean value for delay
 	deviation atomic.Value // delay deviation
 
-	rx   []Packet
-	addr net.Addr
+	rx   []Packet // incoming packets
+	addr net.Addr // local address
 
-	die             chan struct{}
-	mu              sync.Mutex
-	rdDeadLine      atomic.Value
-	wtDeadLine      atomic.Value
-	chNotifyReaders chan struct{}
+	rdDeadLine      atomic.Value  // read deadline
+	wtDeadLine      atomic.Value  // write deadline
+	chNotifyReaders chan struct{} // notify incoming packets
 
-	delayedWriter *TimedSender
+	// timed sender
+	sender *TimedSender
 
-	// stats
+	// stats on this connection
 	sDrop          uint32
 	sSent          uint32
 	sReceived      uint32
@@ -86,8 +87,8 @@ func NewLossyPacketConn(loss float64, delay int) (*LossyPacketConn, error) {
 	conn.die = make(chan struct{})
 	conn.addr = NewAddress()
 	conn.deviation.Store(float64(1.0))
-	conn.delayedWriter = NewDelayedWriter()
-	packetConns.Set(conn)
+	conn.sender = NewDelayedWriter()
+	defaultConnectionManager.Set(conn)
 	return conn, nil
 }
 
@@ -172,11 +173,11 @@ func (conn *LossyPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error)
 		return len(p), nil
 	}
 
-	if remote := packetConns.Get(addr.String()); remote != nil {
+	if remote := defaultConnectionManager.Get(addr.String()); remote != nil {
 		p1 := make([]byte, len(p))
 		copy(p1, p)
 		delay := float64(conn.delay) + conn.deviation.Load().(float64)*mrand.NormFloat64()
-		conn.delayedWriter.Send(remote, Packet{conn.LocalAddr(), p1, time.Now()}, time.Duration(delay)*time.Millisecond)
+		conn.sender.Send(remote, Packet{conn.LocalAddr(), p1, time.Now()}, time.Duration(delay)*time.Millisecond)
 		atomic.AddUint32(&conn.sSent, 1)
 		atomic.AddUint32(&conn.sBytesSent, uint32(len(p)))
 		return len(p), nil

@@ -2,10 +2,10 @@ package lossyconn
 
 import "sync"
 
-var packetConns *ConnectionManager
+var defaultConnectionManager *ConnectionManager
 
 func init() {
-	packetConns = NewConnectionManager()
+	defaultConnectionManager = NewConnectionManager()
 }
 
 type ConnectionManager struct {
