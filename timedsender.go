@@ -9,7 +9,7 @@ import (
 type entry struct {
 	ts     time.Time
 	packet Packet
-	conn   *LossyPacketConn
+	conn   *LossyConn
 }
 
 // TimedSender sends Packet to a connection at given time
@@ -46,7 +46,7 @@ func (h *TimedSender) notify() {
 }
 
 // Send with a delay
-func (h *TimedSender) Send(conn *LossyPacketConn, packet Packet, delay time.Duration) {
+func (h *TimedSender) Send(conn *LossyConn, packet Packet, delay time.Duration) {
 	h.mu.Lock()
 	heap.Push(h, entry{time.Now().Add(delay), packet, conn})
 	h.mu.Unlock()

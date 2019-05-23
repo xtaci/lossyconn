@@ -43,8 +43,8 @@ type Packet struct {
 	ts      time.Time
 }
 
-// LossPacket implements a net.PacketConn with a given loss rate for sending
-type LossyPacketConn struct {
+// LossyConn implements a net.LossyConn with a given loss rate for sending
+type LossyConn struct {
 	die chan struct{}
 	mu  sync.Mutex
 
@@ -70,17 +70,17 @@ type LossyPacketConn struct {
 	sBytesReceived uint32
 }
 
-// NewLossyPacketConn create a loss connection with loss rate and latency
+// NewLossyConn create a loss connection with loss rate and latency
 //
 // loss must be between [0,1]
 //
 // delay is time in millisecond
-func NewLossyPacketConn(loss float64, delay int) (*LossyPacketConn, error) {
+func NewLossyConn(loss float64, delay int) (*LossyConn, error) {
 	if loss < 0 || loss > 1 {
 		return nil, errors.New("loss must be in [0,1]")
 	}
 
-	conn := new(LossyPacketConn)
+	conn := new(LossyConn)
 	conn.loss = int(loss * 100)
 	conn.delay = delay
 	conn.chNotifyReaders = make(chan struct{}, 1)
@@ -95,9 +95,9 @@ func NewLossyPacketConn(loss float64, delay int) (*LossyPacketConn, error) {
 // SetDelayDeviation sets the deviation for delays, delay is the median value
 //
 // Default : 1.0
-func (conn *LossyPacketConn) SetDelayDeviation(deviation float64) { conn.deviation.Store(deviation) }
+func (conn *LossyConn) SetDelayDeviation(deviation float64) { conn.deviation.Store(deviation) }
 
-func (conn *LossyPacketConn) notifyReaders() {
+func (conn *LossyConn) notifyReaders() {
 	select {
 	case conn.chNotifyReaders <- struct{}{}:
 	default:
@@ -105,7 +105,7 @@ func (conn *LossyPacketConn) notifyReaders() {
 }
 
 // simulate receiving a packet internally
-func (conn *LossyPacketConn) receivePacket(packet Packet) {
+func (conn *LossyConn) receivePacket(packet Packet) {
 	conn.mu.Lock()
 	conn.rx = append(conn.rx, packet)
 	conn.mu.Unlock()
@@ -124,7 +124,7 @@ func (conn *LossyPacketConn) receivePacket(packet Packet) {
 // ReadFrom can be made to time out and return
 // an Error with Timeout() == true after a fixed time limit;
 // see SetDeadline and SetReadDeadline.
-func (conn *LossyPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+func (conn *LossyConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 RETRY:
 	conn.mu.Lock()
 
@@ -159,7 +159,7 @@ RETRY:
 // an Error with Timeout() == true after a fixed time limit;
 // see SetDeadline and SetWriteDeadline.
 // On packet-oriented connections, write timeouts are rare.
-func (conn *LossyPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	// close
 	select {
 	case <-conn.die:
@@ -188,7 +188,7 @@ func (conn *LossyPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error)
 
 // Close closes the connection.
 // Any blocked ReadFrom or WriteTo operations will be unblocked and return errors.
-func (conn *LossyPacketConn) Close() error {
+func (conn *LossyConn) Close() error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
@@ -202,7 +202,7 @@ func (conn *LossyPacketConn) Close() error {
 }
 
 // LocalAddr returns the local network address.
-func (conn *LossyPacketConn) LocalAddr() net.Addr { return conn.addr }
+func (conn *LossyConn) LocalAddr() net.Addr { return conn.addr }
 
 // SetDeadline sets the read and write deadlines associated
 // with the connection. It is equivalent to calling both
@@ -219,7 +219,7 @@ func (conn *LossyPacketConn) LocalAddr() net.Addr { return conn.addr }
 // the deadline after successful ReadFrom or WriteTo calls.
 //
 // A zero value for t means I/O operations will not time out.
-func (conn *LossyPacketConn) SetDeadline(t time.Time) error {
+func (conn *LossyConn) SetDeadline(t time.Time) error {
 	conn.rdDeadLine.Store(t)
 	conn.wtDeadLine.Store(t)
 	return nil
@@ -228,7 +228,7 @@ func (conn *LossyPacketConn) SetDeadline(t time.Time) error {
 // SetReadDeadline sets the deadline for future ReadFrom calls
 // and any currently-blocked ReadFrom call.
 // A zero value for t means ReadFrom will not time out.
-func (conn *LossyPacketConn) SetReadDeadline(t time.Time) error {
+func (conn *LossyConn) SetReadDeadline(t time.Time) error {
 	conn.rdDeadLine.Store(t)
 	return nil
 }
@@ -238,12 +238,12 @@ func (conn *LossyPacketConn) SetReadDeadline(t time.Time) error {
 // Even if write times out, it may return n > 0, indicating that
 // some of the data was successfully written.
 // A zero value for t means WriteTo will not time out.
-func (conn *LossyPacketConn) SetWriteDeadline(t time.Time) error {
+func (conn *LossyConn) SetWriteDeadline(t time.Time) error {
 	conn.wtDeadLine.Store(t)
 	return nil
 }
 
-func (conn *LossyPacketConn) String() string {
+func (conn *LossyConn) String() string {
 	return fmt.Sprintf("packet dropped:%v packet sent:%v packet received:%v tx bytes:%v rx bytes:%v",
 		atomic.LoadUint32(&conn.sDrop),
 		atomic.LoadUint32(&conn.sSent),

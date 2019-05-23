@@ -5,12 +5,12 @@ import (
 )
 
 func TestLossyPacket(t *testing.T) {
-	left, err := NewLossyPacketConn(0.3, 200)
+	left, err := NewLossyConn(0.3, 200)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	right, err := NewLossyPacketConn(0.2, 180)
+	right, err := NewLossyConn(0.2, 180)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,12 +26,12 @@ func TestLossyPacket(t *testing.T) {
 }
 
 func BenchmarkLossyPacket(b *testing.B) {
-	left, err := NewLossyPacketConn(0.3, 200)
+	left, err := NewLossyConn(0.3, 200)
 	if err != nil {
 		b.Fatal(err)
 	}
 
-	right, err := NewLossyPacketConn(0.2, 180)
+	right, err := NewLossyConn(0.2, 180)
 	if err != nil {
 		b.Fatal(err)
 	}
