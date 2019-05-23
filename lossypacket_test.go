@@ -41,18 +41,14 @@ func BenchmarkLossyPacket(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		left.WriteTo(p, right.LocalAddr())
 	}
+	right.Close()
+	left.Close()
 
-	count := 0
 	for {
-		if _, _, err := right.ReadFrom(p); err == nil {
-			count++
-		} else {
+		if _, _, err := right.ReadFrom(p); err != nil {
 			break
 		}
 	}
-	left.Close()
-	right.Close()
 	b.Logf("left:%v\n", left)
 	b.Logf("right:%v\n", right)
-
 }
