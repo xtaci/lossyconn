@@ -2,31 +2,40 @@ package lossyconn
 
 import "sync"
 
-var packetConns *PacketConns
+var packetConns *ConnectionManager
 
 func init() {
-	packetConns = NewPacketConns()
+	packetConns = NewConnectionManager()
 }
 
-type PacketConns struct {
+type ConnectionManager struct {
 	conns map[string]*LossyPacketConn
 	mu    sync.Mutex
 }
 
-func NewPacketConns() *PacketConns {
-	mgr := new(PacketConns)
+func NewConnectionManager() *ConnectionManager {
+	mgr := new(ConnectionManager)
 	mgr.conns = make(map[string]*LossyPacketConn)
 	return mgr
 }
 
-func (mgr *PacketConns) Get(addr string) *LossyPacketConn {
+// return a connection from the pool
+func (mgr *ConnectionManager) Get(addr string) *LossyPacketConn {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	return mgr.conns[addr]
 }
 
-func (mgr *PacketConns) Set(conn *LossyPacketConn) {
+// add a connection to the pool
+func (mgr *ConnectionManager) Set(conn *LossyPacketConn) {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	mgr.conns[conn.LocalAddr().String()] = conn
+}
+
+// delete a connection from the pool
+func (mgr *ConnectionManager) Delete(conn *LossyPacketConn) {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	delete(mgr.conns, conn.LocalAddr().String())
 }

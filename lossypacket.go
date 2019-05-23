@@ -1,7 +1,6 @@
 // Package lossyconn is a lossy connection simulator for Golang.
 //
-// lossyconn provides packet oriented and stream oriented
-// lossy connection for testing purpose
+// lossyconn provides packet oriented lossy connection for testing purpose
 package lossyconn
 
 import (
@@ -21,6 +20,7 @@ type Address struct {
 	str string
 }
 
+// NewAddress creates a simulated address by filling with random numbers
 func NewAddress() *Address {
 	addr := new(Address)
 	fakeaddr := make([]byte, 16)
@@ -36,6 +36,7 @@ func (addr *Address) String() string {
 	return addr.str
 }
 
+// Packet defines a data to be sent at some specific time
 type Packet struct {
 	addr    net.Addr
 	payload []byte
@@ -58,7 +59,7 @@ type LossyPacketConn struct {
 	wtDeadLine      atomic.Value
 	chNotifyReaders chan struct{}
 
-	delayedWriter *DelayedWriter
+	delayedWriter *TimedSender
 
 	// stats
 	sDrop          uint32
@@ -91,6 +92,8 @@ func NewLossyPacketConn(loss float64, delay int) (*LossyPacketConn, error) {
 }
 
 // SetDelayDeviation sets the deviation for delays, delay is the median value
+//
+// Default : 1.0
 func (conn *LossyPacketConn) SetDelayDeviation(deviation float64) { conn.deviation.Store(deviation) }
 
 func (conn *LossyPacketConn) notifyReaders() {
