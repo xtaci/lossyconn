@@ -90,7 +90,7 @@ func NewLossyConn(loss float64, delay int) (*LossyConn, error) {
 	conn.die = make(chan struct{})
 	conn.addr = NewAddress()
 	conn.deviation.Store(float64(1.0))
-	conn.sender = NewDelayedWriter()
+	conn.sender = NewTimedSender()
 	conn.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	defaultConnectionManager.Set(conn)
 	return conn, nil

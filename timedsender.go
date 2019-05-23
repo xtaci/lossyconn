@@ -31,7 +31,7 @@ func (h *TimedSender) Pop() interface{} {
 	return x
 }
 
-func NewDelayedWriter() *TimedSender {
+func NewTimedSender() *TimedSender {
 	dw := new(TimedSender)
 	dw.chNotify = make(chan struct{}, 1)
 	go dw.sendLoop()
