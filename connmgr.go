@@ -8,11 +8,13 @@ func init() {
 	defaultConnectionManager = NewConnectionManager()
 }
 
+// ConnectionManager contains all lossy connections
 type ConnectionManager struct {
 	conns map[string]*LossyConn
 	mu    sync.Mutex
 }
 
+// NewConnectionManager create a connection manager for all LossyConn
 func NewConnectionManager() *ConnectionManager {
 	mgr := new(ConnectionManager)
 	mgr.conns = make(map[string]*LossyConn)
