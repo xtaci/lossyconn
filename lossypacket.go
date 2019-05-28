@@ -210,6 +210,7 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 // Close closes the connection.
 // Any blocked ReadFrom or WriteTo operations will be unblocked and return errors.
 func (conn *LossyConn) Close() error {
+	defaultConnectionManager.Delete(conn)
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 
