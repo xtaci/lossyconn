@@ -141,32 +141,35 @@ func (conn *LossyConn) Read(b []byte) (int, error) {
 // an Error with Timeout() == true after a fixed time limit;
 // see SetDeadline and SetReadDeadline.
 func (conn *LossyConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-RETRY:
-	conn.mu.Lock()
+	for {
+		conn.mu.Lock()
+		if len(conn.rx) > 0 {
+			n = copy(p, conn.rx[0].payload)
+			addr = conn.rx[0].addr
+			conn.rx = conn.rx[1:]
+			conn.mu.Unlock()
+			return
+		}
 
-	if len(conn.rx) > 0 {
-		n = copy(p, conn.rx[0].payload)
-		addr = conn.rx[0].addr
-		conn.rx = conn.rx[1:]
+		var timer *time.Timer
+		var deadline <-chan time.Time
+		if d, ok := conn.rdDeadLine.Load().(time.Time); ok && !d.IsZero() {
+			timer = time.NewTimer(time.Until(d))
+			deadline = timer.C
+		}
 		conn.mu.Unlock()
-		return
-	}
 
-	var deadline <-chan time.Time
-	if d, ok := conn.rdDeadLine.Load().(time.Time); ok && !d.IsZero() {
-		timer := time.NewTimer(time.Until(d))
-		defer timer.Stop()
-		deadline = timer.C
-	}
-	conn.mu.Unlock()
+		select {
+		case <-deadline:
+			return 0, nil, errors.New("i/o timeout")
+		case <-conn.die:
+			return 0, nil, errors.New("broken pipe")
+		case <-conn.chNotifyReaders:
+		}
 
-	select {
-	case <-deadline:
-		return 0, nil, errors.New("i/o timeout")
-	case <-conn.chNotifyReaders:
-		goto RETRY
-	case <-conn.die:
-		return 0, nil, errors.New("broken pipe")
+		if timer != nil {
+			timer.Stop()
+		}
 	}
 }
 
