@@ -1,7 +1,8 @@
 package lossyconn
 
 import (
-	"errors"
+	"fmt"
+	"math"
 	"net"
 	"sync"
 	"testing"
@@ -17,6 +18,32 @@ func TestNewLossyConnInvalidInput(t *testing.T) {
 	}
 	if _, err := NewWithConfig(Config{BurstLossRate: -0.1}); err == nil {
 		t.Fatal("expected invalid burst loss error")
+	}
+	if _, err := NewWithConfig(Config{RandomLossRate: math.NaN()}); err == nil {
+		t.Fatal("expected invalid NaN loss error")
+	}
+	if _, err := NewWithConfig(Config{DelayDeviation: math.Inf(1)}); err == nil {
+		t.Fatal("expected invalid infinite delay deviation")
+	}
+	if _, err := NewWithConfig(Config{MaxPendingPackets: -1}); err == nil {
+		t.Fatal("expected invalid pending queue size")
+	}
+}
+
+func TestSetDelayDeviationValidation(t *testing.T) {
+	conn, err := NewWithConfig(Config{Seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	for _, deviation := range []float64{-1, math.NaN(), math.Inf(1)} {
+		if err := conn.SetDelayDeviation(deviation); err == nil {
+			t.Fatalf("expected invalid deviation error for %v", deviation)
+		}
+	}
+	if err := conn.SetDelayDeviation(0); err != nil {
+		t.Fatalf("expected zero deviation to be valid: %v", err)
 	}
 }
 
@@ -114,12 +141,12 @@ func TestBurstLossDropStats(t *testing.T) {
 
 func TestBandwidthAndReorderStats(t *testing.T) {
 	left, err := NewWithConfig(Config{
-		Delay:               0,
-		DelayDeviation:      0,
+		Delay:                0,
+		DelayDeviation:       0,
 		BandwidthBytesPerSec: 100,
-		ReorderRate:         1,
-		MaxReorderDelay:     5 * time.Millisecond,
-		Seed:                1,
+		ReorderRate:          1,
+		MaxReorderDelay:      5 * time.Millisecond,
+		Seed:                 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -203,6 +230,99 @@ func TestQueueDropAndResetStats(t *testing.T) {
 	}
 }
 
+func TestPendingSendQueueLimitAndClose(t *testing.T) {
+	left, err := NewWithConfig(Config{
+		Delay:             time.Hour,
+		DelayDeviation:    0,
+		MaxPendingPackets: 1,
+		Seed:              1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := NewWithConfig(Config{Seed: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer right.Close()
+
+	if _, err := left.WriteTo([]byte("queued"), right.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := left.WriteTo([]byte("overflow"), right.LocalAddr()); err == nil {
+		t.Fatal("expected outgoing queue overflow error")
+	}
+	if got := left.Stats().DropPendingQueue; got != 1 {
+		t.Fatalf("unexpected outgoing queue drop count: %d", got)
+	}
+
+	if err := left.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := right.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := right.ReadFrom(make([]byte, 16)); err == nil {
+		t.Fatal("expected pending packet to be discarded on sender close")
+	}
+}
+
+func TestReadDeadlineCanBeUpdatedWhileBlocked(t *testing.T) {
+	conn, err := NewWithConfig(Config{Seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	result := make(chan error, 1)
+	started := make(chan struct{})
+	if err := conn.SetReadDeadline(time.Now().Add(120 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		close(started)
+		_, _, readErr := conn.ReadFrom(make([]byte, 1))
+		result <- readErr
+	}()
+	<-started
+	time.Sleep(20 * time.Millisecond)
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if !conn.sender.trySend(conn, Packet{addr: fakeAddr("sender"), payload: []byte{1}, ts: time.Now()}, 150*time.Millisecond) {
+		t.Fatal("failed to schedule packet")
+	}
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("read failed after extending deadline: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("read did not complete after packet delivery")
+	}
+}
+
+func TestReadTimeoutImplementsNetError(t *testing.T) {
+	conn, err := NewWithConfig(Config{Seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = conn.ReadFrom(make([]byte, 1))
+	if err == nil {
+		t.Fatal("expected read timeout")
+	}
+	netErr, ok := err.(net.Error)
+	if !ok || !netErr.Timeout() {
+		t.Fatalf("expected net.Error timeout, got %T: %v", err, err)
+	}
+}
+
 func TestReadDeadlineAndCloseUnblock(t *testing.T) {
 	conn, err := NewWithConfig(Config{Delay: 0, Seed: 1})
 	if err != nil {
@@ -271,11 +391,11 @@ func TestWriteDeadlineBehavior(t *testing.T) {
 
 func TestDelayDeviationAffectsObservedDelay(t *testing.T) {
 	left, err := NewWithConfig(Config{
-		Delay:           5 * time.Millisecond,
-		DelayDeviation:  0,
-		RandomLossRate:  0,
-		QueueSize:       256,
-		Seed:            1,
+		Delay:          5 * time.Millisecond,
+		DelayDeviation: 0,
+		RandomLossRate: 0,
+		QueueSize:      256,
+		Seed:           1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -388,6 +508,7 @@ func TestLongRunCounterConsistency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer left.Close()
 
 	right, err := NewWithConfig(Config{
@@ -412,7 +533,7 @@ func TestLongRunCounterConsistency(t *testing.T) {
 				return
 			}
 			if _, _, err := right.ReadFrom(buf); err != nil {
-				if err.Error() == "i/o timeout" {
+				if isTimeout(err) {
 					return
 				}
 				readErr <- err
@@ -429,7 +550,7 @@ func TestLongRunCounterConsistency(t *testing.T) {
 	wg.Wait()
 	close(readErr)
 	for err := range readErr {
-		if err != nil && !errors.Is(err, net.ErrClosed) {
+		if err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -443,6 +564,37 @@ func TestLongRunCounterConsistency(t *testing.T) {
 	dropped := lst.DropRandom + lst.DropBurst
 	if delivered+dropped != totalPackets {
 		t.Fatalf("counter mismatch: delivered=%d dropped=%d total=%d left=%+v right=%+v", delivered, dropped, totalPackets, lst, rst)
+	}
+}
+
+func BenchmarkRoundTrip(b *testing.B) {
+	for _, size := range []int{64, 1024, 65536} {
+		b.Run(fmt.Sprintf("payload-%d", size), func(b *testing.B) {
+			left, err := NewWithConfig(Config{DelayDeviation: 0, QueueSize: 64, Seed: 1})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer left.Close()
+			right, err := NewWithConfig(Config{QueueSize: 64, Seed: 2})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer right.Close()
+
+			payload := make([]byte, size)
+			buf := make([]byte, size)
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := left.WriteTo(payload, right.LocalAddr()); err != nil {
+					b.Fatal(err)
+				}
+				if _, _, err := right.ReadFrom(buf); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 
@@ -499,7 +651,7 @@ func TestSimulationMatrix(t *testing.T) {
 				t.Fatal(err)
 			}
 			if _, _, err := right.ReadFrom(buf); err != nil {
-				if err.Error() == "i/o timeout" {
+				if isTimeout(err) {
 					break
 				}
 				t.Fatal(err)
@@ -517,7 +669,7 @@ func TestSimulationMatrix(t *testing.T) {
 				QueueSize:      256,
 				Seed:           1,
 			},
-			right: Config{QueueSize: 256, Seed: 2},
+			right:         Config{QueueSize: 256, Seed: 2},
 			packets:       64,
 			payloadSize:   256,
 			readAfterSend: true,
@@ -657,6 +809,11 @@ func TestSimulationMatrix(t *testing.T) {
 }
 
 type fakeAddr string
+
+func isTimeout(err error) bool {
+	netErr, ok := err.(net.Error)
+	return ok && netErr.Timeout()
+}
 
 func (a fakeAddr) Network() string { return "lossy" }
 func (a fakeAddr) String() string  { return string(a) }

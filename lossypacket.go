@@ -1,6 +1,7 @@
-// Package lossyconn is a lossy connection simulator for Golang.
+// Package lossyconn provides an in-memory packet connection simulator.
 //
-// lossyconn provides packet oriented lossy connection for testing purpose
+// It supports configurable delay, bandwidth limits, packet loss, reordering,
+// and bounded receive and send queues for network testing.
 package lossyconn
 
 import (
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net"
 	"sync"
@@ -15,12 +17,12 @@ import (
 	"time"
 )
 
-// Address defines a simulated lossy conn address
+// Address is the opaque local address of a simulated connection.
 type Address struct {
 	str string
 }
 
-// NewAddress creates a simulated address by filling with random numbers
+// NewAddress creates a simulated address using cryptographically random bytes.
 func NewAddress() *Address {
 	addr := new(Address)
 	fakeaddr := make([]byte, 16)
@@ -29,14 +31,17 @@ func NewAddress() *Address {
 	return addr
 }
 
+// Network returns the simulated network name.
 func (addr *Address) Network() string {
 	return "lossy"
 }
+
+// String returns the opaque simulated address.
 func (addr *Address) String() string {
 	return addr.str
 }
 
-// Packet defines a data to be sent at some specific time
+// Packet is a payload scheduled for delivery to a simulated connection.
 type Packet struct {
 	addr    net.Addr
 	payload []byte
@@ -45,43 +50,57 @@ type Packet struct {
 
 // Config controls link simulation behavior.
 type Config struct {
-	// Base one-way delay.
+	// One-way base delay.
 	Delay time.Duration
-	// Normal-distribution delay deviation in milliseconds.
+	// Standard deviation of normally distributed delay variation, in milliseconds.
 	DelayDeviation float64
-	// Shaped bandwidth in bytes per second. 0 means unlimited.
+	// Maximum outgoing bandwidth in bytes per second. Zero disables shaping.
 	BandwidthBytesPerSec uint64
-	// Independent random loss rate in [0, 1].
+	// Probability of independently dropping each outgoing packet, in [0, 1].
 	RandomLossRate float64
-	// Probability of starting a burst loss event in [0, 1].
+	// Probability of starting a burst-loss event for an outgoing packet, in [0, 1].
 	BurstLossRate float64
-	// Number of packets dropped in a burst event.
+	// Number of consecutive packets dropped when a burst-loss event starts.
 	BurstLength int
-	// Probability to inject reordering delay in [0, 1].
+	// Probability of adding an extra delay to an outgoing packet, in [0, 1].
 	ReorderRate float64
-	// Maximum extra delay added for reordering.
+	// Maximum extra delay used when reordering a packet.
 	MaxReorderDelay time.Duration
-	// Receive queue size.
+	// Maximum number of received packets buffered by each connection. Zero uses the default.
 	QueueSize int
-	// Random seed. 0 means time-based seed.
+	// Maximum number of packets waiting in the outgoing queue. Zero uses the default.
+	MaxPendingPackets int
+	// Seed for deterministic simulation. Zero selects a time-based seed.
 	Seed int64
 }
 
-// Stats is a snapshot of per-connection counters.
+// Stats is a snapshot of a connection's packet, byte, loss, and delay counters.
 type Stats struct {
-	DropRandom   uint64
-	DropBurst    uint64
-	DropQueue    uint64
-	SentPackets  uint64
-	RecvPackets  uint64
-	SentBytes    uint64
-	RecvBytes    uint64
-	MaxDelay     time.Duration
-	Reordered    uint64
+	// Packets discarded by independent random loss.
+	DropRandom uint64
+	// Packets discarded by burst loss.
+	DropBurst uint64
+	// Packets discarded because the receive queue was full.
+	DropQueue uint64
+	// Writes rejected because the outgoing queue was full or its sender was closed.
+	DropPendingQueue uint64
+	// Packets accepted by WriteTo, including simulated losses.
+	SentPackets uint64
+	// Packets accepted into the receive queue.
+	RecvPackets uint64
+	// Payload bytes accepted by WriteTo.
+	SentBytes uint64
+	// Payload bytes accepted into the receive queue.
+	RecvBytes uint64
+	// Largest observed delivery delay.
+	MaxDelay time.Duration
+	// Packets given an extra delay for reordering.
+	Reordered uint64
+	// Packets scheduled for delivery after a non-zero delay.
 	DelayedSends uint64
 }
 
-// LossyConn implements a net.LossyConn with a given loss rate for sending
+// LossyConn is an in-memory net.PacketConn with configurable network effects.
 type LossyConn struct {
 	die chan struct{}
 	mu  sync.Mutex
@@ -94,6 +113,7 @@ type LossyConn struct {
 	rdDeadLine      atomic.Value  // read deadline
 	wtDeadLine      atomic.Value  // write deadline
 	chNotifyReaders chan struct{} // notify incoming packets
+	chDeadline      chan struct{} // notify blocked readers about deadline changes
 
 	rng *rand.Rand
 
@@ -107,23 +127,24 @@ type LossyConn struct {
 	burstRemain int
 
 	// stats on this connection
-	sDropRandom    uint64
-	sDropBurst     uint64
-	sDropQueue     uint64
-	sReordered     uint64
-	sDelayedSend   uint64
-	sSent          uint64
-	sReceived      uint64
-	sBytesSent     uint64
-	sBytesReceived uint64
-	sMaxDelay      int64
+	sDropRandom       uint64
+	sDropBurst        uint64
+	sDropQueue        uint64
+	sDropPendingQueue uint64
+	sReordered        uint64
+	sDelayedSend      uint64
+	sSent             uint64
+	sReceived         uint64
+	sBytesSent        uint64
+	sBytesReceived    uint64
+	sMaxDelay         int64
 }
 
-// NewLossyConn create a loss connection with loss rate and latency
+// NewLossyConn creates a connection with a packet-loss probability and delay.
 //
-// loss must be between [0,1]
+// loss must be in [0, 1]. delay is the one-way delay in milliseconds.
 //
-// delay is time in millisecond
+// Use NewWithConfig to configure additional network effects.
 func NewLossyConn(loss float64, delay int) (*LossyConn, error) {
 	return NewWithConfig(Config{
 		Delay:          time.Duration(delay) * time.Millisecond,
@@ -139,24 +160,27 @@ func NewLossyPacketConn(loss float64, delay int) (*LossyConn, error) {
 	return NewLossyConn(loss, delay)
 }
 
-// NewWithConfig creates a configurable lossy packet connection.
+// NewWithConfig creates a configurable lossy packet connection. Invalid
+// probabilities, negative delays, and negative outgoing queue limits return an
+// error. Non-positive receive queue limits and zero outgoing limits select the
+// default capacity of 4096 packets.
 func NewWithConfig(cfg Config) (*LossyConn, error) {
 	if cfg.Delay < 0 {
 		return nil, errors.New("delay must be >= 0")
 	}
-	if cfg.DelayDeviation < 0 {
-		return nil, errors.New("delay deviation must be >= 0")
+	if math.IsNaN(cfg.DelayDeviation) || math.IsInf(cfg.DelayDeviation, 0) || cfg.DelayDeviation < 0 {
+		return nil, errors.New("delay deviation must be finite and >= 0")
 	}
-	if cfg.RandomLossRate < 0 || cfg.RandomLossRate > 1 {
+	if math.IsNaN(cfg.RandomLossRate) || cfg.RandomLossRate < 0 || cfg.RandomLossRate > 1 {
 		return nil, errors.New("random loss rate must be in [0,1]")
 	}
-	if cfg.BurstLossRate < 0 || cfg.BurstLossRate > 1 {
+	if math.IsNaN(cfg.BurstLossRate) || cfg.BurstLossRate < 0 || cfg.BurstLossRate > 1 {
 		return nil, errors.New("burst loss rate must be in [0,1]")
 	}
 	if cfg.BurstLength < 0 {
 		return nil, errors.New("burst length must be >= 0")
 	}
-	if cfg.ReorderRate < 0 || cfg.ReorderRate > 1 {
+	if math.IsNaN(cfg.ReorderRate) || cfg.ReorderRate < 0 || cfg.ReorderRate > 1 {
 		return nil, errors.New("reorder rate must be in [0,1]")
 	}
 	if cfg.MaxReorderDelay < 0 {
@@ -165,6 +189,12 @@ func NewWithConfig(cfg Config) (*LossyConn, error) {
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = 4096
 	}
+	if cfg.MaxPendingPackets < 0 {
+		return nil, errors.New("maximum pending packets must be >= 0")
+	}
+	if cfg.MaxPendingPackets == 0 {
+		cfg.MaxPendingPackets = 4096
+	}
 	if cfg.Seed == 0 {
 		cfg.Seed = time.Now().UnixNano()
 	}
@@ -172,20 +202,26 @@ func NewWithConfig(cfg Config) (*LossyConn, error) {
 	conn := new(LossyConn)
 	conn.cfg = cfg
 	conn.chNotifyReaders = make(chan struct{}, 1)
+	conn.chDeadline = make(chan struct{}, 1)
 	conn.die = make(chan struct{})
 	conn.addr = NewAddress()
 	conn.deviation.Store(cfg.DelayDeviation)
-	conn.sender = NewTimedSender()
+	conn.sender = newTimedSender(cfg.MaxPendingPackets)
 	conn.rng = rand.New(rand.NewSource(cfg.Seed))
 	conn.rx = make([]Packet, 0, cfg.QueueSize)
 	defaultConnectionManager.Set(conn)
 	return conn, nil
 }
 
-// SetDelayDeviation sets the deviation for delays, delay is the median value
-//
-// Default : 1.0
-func (conn *LossyConn) SetDelayDeviation(deviation float64) { conn.deviation.Store(deviation) }
+// SetDelayDeviation sets the delay variation's standard deviation in milliseconds.
+// The value must be finite and non-negative. The configured base delay is unchanged.
+func (conn *LossyConn) SetDelayDeviation(deviation float64) error {
+	if math.IsNaN(deviation) || math.IsInf(deviation, 0) || deviation < 0 {
+		return errors.New("delay deviation must be a finite value >= 0")
+	}
+	conn.deviation.Store(deviation)
+	return nil
+}
 
 func (conn *LossyConn) notifyReaders() {
 	select {
@@ -194,9 +230,15 @@ func (conn *LossyConn) notifyReaders() {
 	}
 }
 
-// simulate receiving a packet internally
+// receivePacket queues a delivered packet unless the connection is closed or full.
 func (conn *LossyConn) receivePacket(packet Packet) {
 	conn.mu.Lock()
+	select {
+	case <-conn.die:
+		conn.mu.Unlock()
+		return
+	default:
+	}
 	if conn.cfg.QueueSize > 0 && len(conn.rx) >= conn.cfg.QueueSize {
 		conn.mu.Unlock()
 		atomic.AddUint64(&conn.sDropQueue, 1)
@@ -207,30 +249,24 @@ func (conn *LossyConn) receivePacket(packet Packet) {
 	conn.notifyReaders()
 	atomic.AddUint64(&conn.sReceived, 1)
 	atomic.AddUint64(&conn.sBytesReceived, uint64(len(packet.payload)))
-	delay := time.Now().Sub(packet.ts)
-	if time.Now().Sub(packet.ts) > time.Duration(atomic.LoadInt64(&conn.sMaxDelay)) {
-		atomic.StoreInt64(&conn.sMaxDelay, int64(delay))
+	delay := time.Since(packet.ts)
+	for observed := atomic.LoadInt64(&conn.sMaxDelay); int64(delay) > observed; observed = atomic.LoadInt64(&conn.sMaxDelay) {
+		if atomic.CompareAndSwapInt64(&conn.sMaxDelay, observed, int64(delay)) {
+			break
+		}
 	}
 }
 
-// Implementation of the Conn interface.
-
-// Read implements the Conn Read method.
+// Read implements the net.Conn Read method.
 func (conn *LossyConn) Read(b []byte) (int, error) {
 	n, _, err := conn.ReadFrom(b)
 	return n, err
 }
 
-// ReadFrom reads a packet from the connection,
-// copying the payload into p. It returns the number of
-// bytes copied into p and the return address that
-// was on the packet.
-// It returns the number of bytes read (0 <= n <= len(p))
-// and any error encountered. Callers should always process
-// the n > 0 bytes returned before considering the error err.
-// ReadFrom can be made to time out and return
-// an Error with Timeout() == true after a fixed time limit;
-// see SetDeadline and SetReadDeadline.
+// ReadFrom reads one packet, copying its payload into p and returning its source
+// address. The returned byte count is between zero and len(p); if p is too small,
+// the remainder of the packet is discarded. If no packet is available before a
+// configured read deadline, the method returns a net.Error with Timeout() == true.
 func (conn *LossyConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	for {
 		conn.mu.Lock()
@@ -252,30 +288,44 @@ func (conn *LossyConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 
 		select {
 		case <-deadline:
-			return 0, nil, errors.New("i/o timeout")
+			if current, ok := conn.rdDeadLine.Load().(time.Time); ok && (current.IsZero() || time.Now().Before(current)) {
+				continue
+			}
+			return 0, nil, timeoutError("read")
 		case <-conn.die:
+			stopTimer(timer)
 			return 0, nil, errors.New("broken pipe")
 		case <-conn.chNotifyReaders:
+		case <-conn.chDeadline:
 		}
 
-		if timer != nil {
-			timer.Stop()
+		stopTimer(timer)
+	}
+}
+
+func stopTimer(timer *time.Timer) {
+	if timer == nil {
+		return
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
 		}
 	}
 }
 
-// Write implements the Conn Write method.
+// Write implements net.Conn Write. LossyConn is packet-oriented, so stream writes
+// are unsupported.
 func (conn *LossyConn) Write(p []byte) (n int, err error) {
 	return 0, io.ErrNoProgress
 }
 
-// WriteTo writes a packet with payload p to addr.
-// WriteTo can be made to time out and return
-// an Error with Timeout() == true after a fixed time limit;
-// see SetDeadline and SetWriteDeadline.
-// On packet-oriented connections, write timeouts are rare.
+// WriteTo schedules p for delivery to addr. It returns an error if addr is not
+// reachable, the write deadline has expired, the bounded outgoing queue is full,
+// or the connection is closing. Simulated packet loss is reported as a successful
+// write, as with a network send.
 func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	// close
 	select {
 	case <-conn.die:
 		return 0, io.EOF
@@ -283,7 +333,7 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	}
 
 	if d, ok := conn.wtDeadLine.Load().(time.Time); ok && !d.IsZero() && time.Now().After(d) {
-		return 0, errors.New("i/o timeout")
+		return 0, timeoutError("write")
 	}
 	if addr == nil {
 		return 0, errors.New("nil address")
@@ -307,20 +357,31 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		if conn.cfg.BandwidthBytesPerSec > 0 {
 			serialization = time.Duration((uint64(len(p))*uint64(time.Second) + conn.cfg.BandwidthBytesPerSec - 1) / conn.cfg.BandwidthBytesPerSec)
 		}
-		conn.nextSend = start.Add(serialization)
-		sendDelay := conn.nextSend.Sub(now) + conn.baseDelayLocked()
-		if conn.shouldReorderLocked() {
+		nextSend := start.Add(serialization)
+		sendDelay := nextSend.Sub(now) + conn.baseDelayLocked()
+		reordered := conn.shouldReorderLocked()
+		if reordered {
 			sendDelay += conn.reorderDelayLocked()
-			atomic.AddUint64(&conn.sReordered, 1)
 		}
-		if sendDelay > 0 {
-			atomic.AddUint64(&conn.sDelayedSend, 1)
-		}
-		conn.mu.Unlock()
+		delayed := sendDelay > 0
 
 		p1 := make([]byte, len(p))
 		copy(p1, p)
-		conn.sender.Send(remote, Packet{conn.LocalAddr(), p1, time.Now()}, sendDelay)
+		queued := conn.sender.trySend(remote, Packet{conn.LocalAddr(), p1, time.Now()}, sendDelay)
+		if queued {
+			conn.nextSend = nextSend
+		}
+		conn.mu.Unlock()
+		if !queued {
+			atomic.AddUint64(&conn.sDropPendingQueue, 1)
+			return 0, errors.New("pending send queue is full or closed")
+		}
+		if reordered {
+			atomic.AddUint64(&conn.sReordered, 1)
+		}
+		if delayed {
+			atomic.AddUint64(&conn.sDelayedSend, 1)
+		}
 		atomic.AddUint64(&conn.sSent, 1)
 		atomic.AddUint64(&conn.sBytesSent, uint64(len(p)))
 		return len(p), nil
@@ -329,72 +390,75 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	}
 }
 
-// Close closes the connection.
-// Any blocked ReadFrom or WriteTo operations will be unblocked and return errors.
+// Close closes the connection, unblocks blocked reads, stops its sender, and
+// discards packets that have not yet been delivered.
 func (conn *LossyConn) Close() error {
 	defaultConnectionManager.Delete(conn)
 	conn.mu.Lock()
-	defer conn.mu.Unlock()
-
 	select {
 	case <-conn.die:
+		conn.mu.Unlock()
 		return errors.New("broken pipe")
 	default:
 		close(conn.die)
-		return nil
 	}
+	conn.mu.Unlock()
+	return conn.sender.Close()
 }
 
-// LocalAddr returns the local network address.
+// LocalAddr returns the connection's simulated local address.
 func (conn *LossyConn) LocalAddr() net.Addr { return conn.addr }
 
-// RemoteAddr returns the remote network address.
+// RemoteAddr returns nil because a simulated connection can send to multiple peers.
 func (conn *LossyConn) RemoteAddr() net.Addr { return nil }
 
-// SetDeadline sets the read and write deadlines associated
-// with the connection. It is equivalent to calling both
-// SetReadDeadline and SetWriteDeadline.
+// SetDeadline sets both read and write deadlines. It is equivalent to calling
+// SetReadDeadline and SetWriteDeadline with the same absolute time.
 //
-// A deadline is an absolute time after which I/O operations
-// fail with a timeout (see type Error) instead of
-// blocking. The deadline applies to all future and pending
-// I/O, not just the immediately following call to ReadFrom or
-// WriteTo. After a deadline has been exceeded, the connection
-// can be refreshed by setting a deadline in the future.
+// A deadline applies to current and future operations. Reads already in progress
+// are woken when the deadline changes. A read with no available packet waits until
+// data arrives, the connection closes, or the deadline expires. WriteTo checks its
+// deadline before scheduling a packet. Setting a later deadline allows subsequent
+// operations to proceed.
 //
-// An idle timeout can be implemented by repeatedly extending
-// the deadline after successful ReadFrom or WriteTo calls.
-//
-// A zero value for t means I/O operations will not time out.
+// A zero time disables deadlines.
 func (conn *LossyConn) SetDeadline(t time.Time) error {
 	conn.rdDeadLine.Store(t)
 	conn.wtDeadLine.Store(t)
+	conn.notifyDeadlineChange()
 	return nil
 }
 
-// SetReadDeadline sets the deadline for future ReadFrom calls
-// and any currently-blocked ReadFrom call.
-// A zero value for t means ReadFrom will not time out.
+// SetReadDeadline sets the deadline for current and future ReadFrom calls.
+// A zero time disables the read deadline.
 func (conn *LossyConn) SetReadDeadline(t time.Time) error {
 	conn.rdDeadLine.Store(t)
+	conn.notifyDeadlineChange()
 	return nil
 }
 
-// SetWriteDeadline sets the deadline for future WriteTo calls
-// and any currently-blocked WriteTo call.
-// Even if write times out, it may return n > 0, indicating that
-// some of the data was successfully written.
-// A zero value for t means WriteTo will not time out.
+func (conn *LossyConn) notifyDeadlineChange() {
+	select {
+	case conn.chDeadline <- struct{}{}:
+	default:
+	}
+}
+
+// SetWriteDeadline sets the deadline checked by current and future WriteTo calls.
+// WriteTo does not block while waiting for delivery. A zero time disables the
+// write deadline.
 func (conn *LossyConn) SetWriteDeadline(t time.Time) error {
 	conn.wtDeadLine.Store(t)
 	return nil
 }
 
+// String returns a summary of packet, byte, loss, and delay statistics.
 func (conn *LossyConn) String() string {
-	return fmt.Sprintf("packet dropped(random):%v dropped(burst):%v dropped(queue):%v packet sent:%v packet received:%v tx bytes:%v rx bytes:%v reordered:%v delayed sends:%v max delay:%v",
+	return fmt.Sprintf("packet dropped(random):%v dropped(burst):%v dropped(queue):%v dropped(pending queue):%v packet sent:%v packet received:%v tx bytes:%v rx bytes:%v reordered:%v delayed sends:%v max delay:%v",
 		atomic.LoadUint64(&conn.sDropRandom),
 		atomic.LoadUint64(&conn.sDropBurst),
 		atomic.LoadUint64(&conn.sDropQueue),
+		atomic.LoadUint64(&conn.sDropPendingQueue),
 		atomic.LoadUint64(&conn.sSent),
 		atomic.LoadUint64(&conn.sReceived),
 		atomic.LoadUint64(&conn.sBytesSent),
@@ -405,27 +469,29 @@ func (conn *LossyConn) String() string {
 	)
 }
 
-// Stats returns per-connection counters.
+// Stats returns a snapshot of the connection's counters.
 func (conn *LossyConn) Stats() Stats {
 	return Stats{
-		DropRandom:   atomic.LoadUint64(&conn.sDropRandom),
-		DropBurst:    atomic.LoadUint64(&conn.sDropBurst),
-		DropQueue:    atomic.LoadUint64(&conn.sDropQueue),
-		SentPackets:  atomic.LoadUint64(&conn.sSent),
-		RecvPackets:  atomic.LoadUint64(&conn.sReceived),
-		SentBytes:    atomic.LoadUint64(&conn.sBytesSent),
-		RecvBytes:    atomic.LoadUint64(&conn.sBytesReceived),
-		MaxDelay:     time.Duration(atomic.LoadInt64(&conn.sMaxDelay)),
-		Reordered:    atomic.LoadUint64(&conn.sReordered),
-		DelayedSends: atomic.LoadUint64(&conn.sDelayedSend),
+		DropRandom:       atomic.LoadUint64(&conn.sDropRandom),
+		DropBurst:        atomic.LoadUint64(&conn.sDropBurst),
+		DropQueue:        atomic.LoadUint64(&conn.sDropQueue),
+		DropPendingQueue: atomic.LoadUint64(&conn.sDropPendingQueue),
+		SentPackets:      atomic.LoadUint64(&conn.sSent),
+		RecvPackets:      atomic.LoadUint64(&conn.sReceived),
+		SentBytes:        atomic.LoadUint64(&conn.sBytesSent),
+		RecvBytes:        atomic.LoadUint64(&conn.sBytesReceived),
+		MaxDelay:         time.Duration(atomic.LoadInt64(&conn.sMaxDelay)),
+		Reordered:        atomic.LoadUint64(&conn.sReordered),
+		DelayedSends:     atomic.LoadUint64(&conn.sDelayedSend),
 	}
 }
 
-// ResetStats resets all counters to zero.
+// ResetStats resets all counters, including the observed maximum delay.
 func (conn *LossyConn) ResetStats() {
 	atomic.StoreUint64(&conn.sDropRandom, 0)
 	atomic.StoreUint64(&conn.sDropBurst, 0)
 	atomic.StoreUint64(&conn.sDropQueue, 0)
+	atomic.StoreUint64(&conn.sDropPendingQueue, 0)
 	atomic.StoreUint64(&conn.sReordered, 0)
 	atomic.StoreUint64(&conn.sDelayedSend, 0)
 	atomic.StoreUint64(&conn.sSent, 0)
@@ -434,6 +500,12 @@ func (conn *LossyConn) ResetStats() {
 	atomic.StoreUint64(&conn.sBytesReceived, 0)
 	atomic.StoreInt64(&conn.sMaxDelay, 0)
 }
+
+type timeoutError string
+
+func (e timeoutError) Error() string   { return string(e) + ": i/o timeout" }
+func (e timeoutError) Timeout() bool   { return true }
+func (e timeoutError) Temporary() bool { return true }
 
 func (conn *LossyConn) shouldDropLocked() bool {
 	if conn.burstRemain > 0 {

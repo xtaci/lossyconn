@@ -12,11 +12,16 @@ type entry struct {
 	conn   *LossyConn
 }
 
-// TimedSender sends Packet to a connection at given time
+// TimedSender delivers packets to connections at their scheduled times.
+// Call Close when the sender is no longer needed.
 type TimedSender struct {
-	entries  []entry
-	chNotify chan struct{}
-	mu       sync.Mutex
+	entries    []entry
+	chNotify   chan struct{}
+	chStop     chan struct{}
+	chDone     chan struct{}
+	maxPending int
+	closed     bool
+	mu         sync.Mutex
 }
 
 func (h *TimedSender) Len() int           { return len(h.entries) }
@@ -31,9 +36,18 @@ func (h *TimedSender) Pop() interface{} {
 	return x
 }
 
+// NewTimedSender creates an unbounded sender. Call Close when finished.
 func NewTimedSender() *TimedSender {
-	dw := new(TimedSender)
-	dw.chNotify = make(chan struct{}, 1)
+	return newTimedSender(0)
+}
+
+func newTimedSender(maxPending int) *TimedSender {
+	dw := &TimedSender{
+		chNotify:   make(chan struct{}, 1),
+		chStop:     make(chan struct{}),
+		chDone:     make(chan struct{}),
+		maxPending: maxPending,
+	}
 	go dw.sendLoop()
 	return dw
 }
@@ -45,36 +59,83 @@ func (h *TimedSender) notify() {
 	}
 }
 
-// Send with a delay
+// Send schedules packet for delivery after delay. Calls made after Close are ignored.
 func (h *TimedSender) Send(conn *LossyConn, packet Packet, delay time.Duration) {
+	h.trySend(conn, packet, delay)
+}
+
+func (h *TimedSender) trySend(conn *LossyConn, packet Packet, delay time.Duration) bool {
 	h.mu.Lock()
+	if h.closed || (h.maxPending > 0 && h.Len() >= h.maxPending) {
+		h.mu.Unlock()
+		return false
+	}
 	heap.Push(h, entry{time.Now().Add(delay), packet, conn})
 	h.mu.Unlock()
 	h.notify()
+	return true
+}
+
+// Close stops the sender and discards packets that have not yet been delivered.
+// It is safe to call Close more than once.
+func (h *TimedSender) Close() error {
+	h.mu.Lock()
+	if !h.closed {
+		h.closed = true
+		h.entries = nil
+		close(h.chStop)
+	}
+	h.mu.Unlock()
+	<-h.chDone
+	return nil
 }
 
 func (h *TimedSender) sendLoop() {
-	timer := time.NewTimer(0)
+	defer close(h.chDone)
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+
 	for {
+		h.mu.Lock()
+		if h.closed {
+			h.mu.Unlock()
+			return
+		}
+		if h.Len() > 0 && !time.Now().Before(h.entries[0].ts) {
+			entry := heap.Pop(h).(entry)
+			h.mu.Unlock()
+			entry.conn.receivePacket(entry.packet)
+			continue
+		}
+		var wait time.Duration
+		if h.Len() > 0 {
+			wait = time.Until(h.entries[0].ts)
+		}
+		h.mu.Unlock()
+
+		if wait <= 0 {
+			select {
+			case <-h.chNotify:
+				continue
+			case <-h.chStop:
+				return
+			}
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(wait)
 		select {
 		case <-timer.C:
 		case <-h.chNotify:
+		case <-h.chStop:
+			return
 		}
-
-		h.mu.Lock()
-		for h.Len() > 0 {
-			entry := &h.entries[0]
-			if !time.Now().Before(entry.ts) {
-				entry.conn.receivePacket(entry.packet)
-				heap.Pop(h)
-			} else {
-				break
-			}
-		}
-
-		if h.Len() > 0 {
-			timer.Reset(h.entries[0].ts.Sub(time.Now()))
-		}
-		h.mu.Unlock()
 	}
 }

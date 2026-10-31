@@ -8,34 +8,34 @@ func init() {
 	defaultConnectionManager = NewConnectionManager()
 }
 
-// ConnectionManager contains all lossy connections
+// ConnectionManager indexes simulated connections by local address.
 type ConnectionManager struct {
 	conns map[string]*LossyConn
 	mu    sync.RWMutex
 }
 
-// NewConnectionManager create a connection manager for all LossyConn
+// NewConnectionManager creates an empty connection manager.
 func NewConnectionManager() *ConnectionManager {
 	mgr := new(ConnectionManager)
 	mgr.conns = make(map[string]*LossyConn)
 	return mgr
 }
 
-// return a connection from the pool
+// Get returns the connection registered for addr, or nil if none exists.
 func (mgr *ConnectionManager) Get(addr string) *LossyConn {
 	mgr.mu.RLock()
 	defer mgr.mu.RUnlock()
 	return mgr.conns[addr]
 }
 
-// add a connection to the pool
+// Set registers conn by its local address.
 func (mgr *ConnectionManager) Set(conn *LossyConn) {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	mgr.conns[conn.LocalAddr().String()] = conn
 }
 
-// delete a connection from the pool
+// Delete removes conn from the manager.
 func (mgr *ConnectionManager) Delete(conn *LossyConn) {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
