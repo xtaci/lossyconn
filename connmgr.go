@@ -11,7 +11,7 @@ func init() {
 // ConnectionManager contains all lossy connections
 type ConnectionManager struct {
 	conns map[string]*LossyConn
-	mu    sync.Mutex
+	mu    sync.RWMutex
 }
 
 // NewConnectionManager create a connection manager for all LossyConn
@@ -23,8 +23,8 @@ func NewConnectionManager() *ConnectionManager {
 
 // return a connection from the pool
 func (mgr *ConnectionManager) Get(addr string) *LossyConn {
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
 	return mgr.conns[addr]
 }
 
