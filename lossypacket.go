@@ -62,6 +62,10 @@ type Config struct {
 	MaxPacketSize int
 	// Maximum time a packet may remain in transit. Zero disables expiration.
 	PacketLifetime time.Duration
+	// Added delay per packet already waiting in the outgoing queue.
+	QueueDelayPerPacket time.Duration
+	// Maximum congestion delay. Required when QueueDelayPerPacket is positive.
+	MaxQueueDelay time.Duration
 	// Probability of independently dropping each outgoing packet, in [0, 1].
 	RandomLossRate float64
 	// Probability of starting a burst-loss event for an outgoing packet, in [0, 1].
@@ -96,6 +100,8 @@ type Stats struct {
 	DropOversize uint64
 	// Packets discarded after their configured lifetime elapsed in transit.
 	DropExpired uint64
+	// Packets discarded while the outgoing link was disabled.
+	DropLinkDown uint64
 	// Additional packet copies scheduled by simulated duplication.
 	DuplicatedPackets uint64
 	// Accepted outgoing packets whose payload was changed by simulated corruption.
@@ -114,6 +120,8 @@ type Stats struct {
 	MaxDelay time.Duration
 	// Packets given an extra delay for reordering.
 	Reordered uint64
+	// Packets given additional congestion delay from the pending send queue.
+	QueueDelayedPackets uint64
 	// Packets scheduled for delivery after a non-zero delay.
 	DelayedSends uint64
 }
@@ -143,6 +151,7 @@ type LossyConn struct {
 	deviation atomic.Value
 	// burst state
 	burstRemain int
+	linkUp      bool
 
 	// stats on this connection
 	sDropRandom       uint64
@@ -150,6 +159,7 @@ type LossyConn struct {
 	sDropQueue        uint64
 	sDropOversize     uint64
 	sDropExpired      uint64
+	sDropLinkDown     uint64
 	sDuplicated       uint64
 	sCorrupted        uint64
 	sDropPendingQueue uint64
@@ -160,6 +170,7 @@ type LossyConn struct {
 	sBytesSent        uint64
 	sBytesReceived    uint64
 	sMaxDelay         int64
+	sQueueDelayed     uint64
 }
 
 // NewLossyConn creates a connection with a packet-loss probability and delay.
@@ -195,6 +206,15 @@ func NewWithConfig(cfg Config) (*LossyConn, error) {
 	}
 	if cfg.PacketLifetime < 0 {
 		return nil, errors.New("packet lifetime must be >= 0")
+	}
+	if cfg.QueueDelayPerPacket < 0 {
+		return nil, errors.New("queue delay per packet must be >= 0")
+	}
+	if cfg.MaxQueueDelay < 0 {
+		return nil, errors.New("maximum queue delay must be >= 0")
+	}
+	if cfg.QueueDelayPerPacket > 0 && cfg.MaxQueueDelay == 0 {
+		return nil, errors.New("maximum queue delay must be > 0 when queue delay is enabled")
 	}
 	if math.IsNaN(cfg.DelayDeviation) || math.IsInf(cfg.DelayDeviation, 0) || cfg.DelayDeviation < 0 {
 		return nil, errors.New("delay deviation must be finite and >= 0")
@@ -235,6 +255,7 @@ func NewWithConfig(cfg Config) (*LossyConn, error) {
 
 	conn := new(LossyConn)
 	conn.cfg = cfg
+	conn.linkUp = true
 	conn.chNotifyReaders = make(chan struct{}, 1)
 	conn.chDeadline = make(chan struct{}, 1)
 	conn.die = make(chan struct{})
@@ -379,14 +400,21 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	}
 
 	if remote := defaultConnectionManager.Get(addr.String()); remote != nil {
+		conn.mu.Lock()
+		if !conn.linkUp {
+			conn.mu.Unlock()
+			atomic.AddUint64(&conn.sDropLinkDown, 1)
+			atomic.AddUint64(&conn.sSent, 1)
+			atomic.AddUint64(&conn.sBytesSent, uint64(len(p)))
+			return len(p), nil
+		}
 		if conn.cfg.MaxPacketSize > 0 && len(p) > conn.cfg.MaxPacketSize {
+			conn.mu.Unlock()
 			atomic.AddUint64(&conn.sDropOversize, 1)
 			atomic.AddUint64(&conn.sSent, 1)
 			atomic.AddUint64(&conn.sBytesSent, uint64(len(p)))
 			return len(p), nil
 		}
-
-		conn.mu.Lock()
 		if conn.shouldDropLocked() {
 			conn.mu.Unlock()
 			atomic.AddUint64(&conn.sSent, 1)
@@ -404,10 +432,12 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 			serialization = time.Duration((uint64(len(p))*uint64(time.Second) + conn.cfg.BandwidthBytesPerSec - 1) / conn.cfg.BandwidthBytesPerSec)
 		}
 		nextSend := start.Add(serialization)
-		sendDelay := nextSend.Sub(now) + conn.baseDelayLocked()
+		sendDelay := addDurationSaturated(nextSend.Sub(now), conn.baseDelayLocked())
+		queueDelay := conn.queueDelayLocked(conn.sender.pending())
+		sendDelay = addDurationSaturated(sendDelay, queueDelay)
 		reordered := conn.shouldReorderLocked()
 		if reordered {
-			sendDelay += conn.reorderDelayLocked()
+			sendDelay = addDurationSaturated(sendDelay, conn.reorderDelayLocked())
 		}
 		delayed := sendDelay > 0
 
@@ -443,6 +473,9 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		if delayed {
 			atomic.AddUint64(&conn.sDelayedSend, 1)
 		}
+		if queueDelay > 0 {
+			atomic.AddUint64(&conn.sQueueDelayed, 1)
+		}
 		if duplicated {
 			atomic.AddUint64(&conn.sDuplicated, 1)
 		}
@@ -455,6 +488,41 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	} else {
 		return 0, io.ErrUnexpectedEOF
 	}
+}
+
+// SetLinkState enables or disables this connection's outgoing link.
+// Writes while disabled are accepted and counted, but packets are discarded.
+func (conn *LossyConn) SetLinkState(up bool) {
+	conn.mu.Lock()
+	conn.linkUp = up
+	conn.mu.Unlock()
+}
+
+func (conn *LossyConn) queueDelayLocked(pending int) time.Duration {
+	if pending <= 0 || conn.cfg.QueueDelayPerPacket <= 0 {
+		return 0
+	}
+	perPacket := conn.cfg.QueueDelayPerPacket
+	maxDelay := conn.cfg.MaxQueueDelay
+	if int64(pending) > int64(maxDelay/perPacket) {
+		return maxDelay
+	}
+	delay := time.Duration(pending) * perPacket
+	if delay > maxDelay {
+		return maxDelay
+	}
+	return delay
+}
+
+func addDurationSaturated(a, b time.Duration) time.Duration {
+	const maxDuration = time.Duration(1<<63 - 1)
+	if b > 0 && a > maxDuration-b {
+		return maxDuration
+	}
+	if b < 0 && a < time.Duration(-1<<63)-b {
+		return time.Duration(-1 << 63)
+	}
+	return a + b
 }
 
 // Close closes the connection, unblocks blocked reads, stops its sender, and
@@ -521,12 +589,13 @@ func (conn *LossyConn) SetWriteDeadline(t time.Time) error {
 
 // String returns a summary of packet, byte, loss, and delay statistics.
 func (conn *LossyConn) String() string {
-	return fmt.Sprintf("packet dropped(random):%v dropped(burst):%v dropped(queue):%v dropped(oversize):%v dropped(expired):%v dropped(pending queue):%v duplicated:%v corrupted:%v packet sent:%v packet received:%v tx bytes:%v rx bytes:%v reordered:%v delayed sends:%v max delay:%v",
+	return fmt.Sprintf("packet dropped(random):%v dropped(burst):%v dropped(queue):%v dropped(oversize):%v dropped(expired):%v dropped(link down):%v dropped(pending queue):%v duplicated:%v corrupted:%v packet sent:%v packet received:%v tx bytes:%v rx bytes:%v reordered:%v queue delayed:%v delayed sends:%v max delay:%v",
 		atomic.LoadUint64(&conn.sDropRandom),
 		atomic.LoadUint64(&conn.sDropBurst),
 		atomic.LoadUint64(&conn.sDropQueue),
 		atomic.LoadUint64(&conn.sDropOversize),
 		atomic.LoadUint64(&conn.sDropExpired),
+		atomic.LoadUint64(&conn.sDropLinkDown),
 		atomic.LoadUint64(&conn.sDropPendingQueue),
 		atomic.LoadUint64(&conn.sDuplicated),
 		atomic.LoadUint64(&conn.sCorrupted),
@@ -535,6 +604,7 @@ func (conn *LossyConn) String() string {
 		atomic.LoadUint64(&conn.sBytesSent),
 		atomic.LoadUint64(&conn.sBytesReceived),
 		atomic.LoadUint64(&conn.sReordered),
+		atomic.LoadUint64(&conn.sQueueDelayed),
 		atomic.LoadUint64(&conn.sDelayedSend),
 		time.Duration(atomic.LoadInt64(&conn.sMaxDelay)),
 	)
@@ -543,21 +613,23 @@ func (conn *LossyConn) String() string {
 // Stats returns a snapshot of the connection's counters.
 func (conn *LossyConn) Stats() Stats {
 	return Stats{
-		DropRandom:        atomic.LoadUint64(&conn.sDropRandom),
-		DropBurst:         atomic.LoadUint64(&conn.sDropBurst),
-		DropQueue:         atomic.LoadUint64(&conn.sDropQueue),
-		DropOversize:      atomic.LoadUint64(&conn.sDropOversize),
-		DropExpired:       atomic.LoadUint64(&conn.sDropExpired),
-		DuplicatedPackets: atomic.LoadUint64(&conn.sDuplicated),
-		CorruptedPackets:  atomic.LoadUint64(&conn.sCorrupted),
-		DropPendingQueue:  atomic.LoadUint64(&conn.sDropPendingQueue),
-		SentPackets:       atomic.LoadUint64(&conn.sSent),
-		RecvPackets:       atomic.LoadUint64(&conn.sReceived),
-		SentBytes:         atomic.LoadUint64(&conn.sBytesSent),
-		RecvBytes:         atomic.LoadUint64(&conn.sBytesReceived),
-		MaxDelay:          time.Duration(atomic.LoadInt64(&conn.sMaxDelay)),
-		Reordered:         atomic.LoadUint64(&conn.sReordered),
-		DelayedSends:      atomic.LoadUint64(&conn.sDelayedSend),
+		DropRandom:          atomic.LoadUint64(&conn.sDropRandom),
+		DropBurst:           atomic.LoadUint64(&conn.sDropBurst),
+		DropQueue:           atomic.LoadUint64(&conn.sDropQueue),
+		DropOversize:        atomic.LoadUint64(&conn.sDropOversize),
+		DropExpired:         atomic.LoadUint64(&conn.sDropExpired),
+		DropLinkDown:        atomic.LoadUint64(&conn.sDropLinkDown),
+		DuplicatedPackets:   atomic.LoadUint64(&conn.sDuplicated),
+		CorruptedPackets:    atomic.LoadUint64(&conn.sCorrupted),
+		DropPendingQueue:    atomic.LoadUint64(&conn.sDropPendingQueue),
+		SentPackets:         atomic.LoadUint64(&conn.sSent),
+		RecvPackets:         atomic.LoadUint64(&conn.sReceived),
+		SentBytes:           atomic.LoadUint64(&conn.sBytesSent),
+		RecvBytes:           atomic.LoadUint64(&conn.sBytesReceived),
+		MaxDelay:            time.Duration(atomic.LoadInt64(&conn.sMaxDelay)),
+		Reordered:           atomic.LoadUint64(&conn.sReordered),
+		QueueDelayedPackets: atomic.LoadUint64(&conn.sQueueDelayed),
+		DelayedSends:        atomic.LoadUint64(&conn.sDelayedSend),
 	}
 }
 
@@ -568,6 +640,7 @@ func (conn *LossyConn) ResetStats() {
 	atomic.StoreUint64(&conn.sDropQueue, 0)
 	atomic.StoreUint64(&conn.sDropOversize, 0)
 	atomic.StoreUint64(&conn.sDropExpired, 0)
+	atomic.StoreUint64(&conn.sDropLinkDown, 0)
 	atomic.StoreUint64(&conn.sDuplicated, 0)
 	atomic.StoreUint64(&conn.sCorrupted, 0)
 	atomic.StoreUint64(&conn.sDropPendingQueue, 0)
@@ -578,6 +651,7 @@ func (conn *LossyConn) ResetStats() {
 	atomic.StoreUint64(&conn.sBytesSent, 0)
 	atomic.StoreUint64(&conn.sBytesReceived, 0)
 	atomic.StoreInt64(&conn.sMaxDelay, 0)
+	atomic.StoreUint64(&conn.sQueueDelayed, 0)
 }
 
 type timeoutError string

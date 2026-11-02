@@ -85,6 +85,12 @@ func (h *TimedSender) trySendBatch(conn *LossyConn, packets []Packet, delay time
 	return true
 }
 
+func (h *TimedSender) pending() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.Len()
+}
+
 // Close stops the sender and discards packets that have not yet been delivered.
 // It is safe to call Close more than once.
 func (h *TimedSender) Close() error {
@@ -113,6 +119,7 @@ func (h *TimedSender) sendLoop() {
 			h.mu.Unlock()
 			return
 		}
+		hasEntries := h.Len() > 0
 		if h.Len() > 0 && !time.Now().Before(h.entries[0].ts) {
 			entry := heap.Pop(h).(entry)
 			h.mu.Unlock()
@@ -126,6 +133,9 @@ func (h *TimedSender) sendLoop() {
 		h.mu.Unlock()
 
 		if wait <= 0 {
+			if hasEntries {
+				continue
+			}
 			select {
 			case <-h.chNotify:
 				continue

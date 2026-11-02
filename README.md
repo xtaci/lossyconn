@@ -13,9 +13,10 @@
 
 `lossyconn` is an in-memory, packet-oriented network simulator for Go tests. It
 implements `net.PacketConn` and can simulate one-way delay, delay variation,
-bandwidth limits, maximum packet sizes and lifetimes, random and burst packet
-loss, packet duplication and payload corruption, packet reordering, and bounded
-queues. A fixed seed makes a simulation reproducible.
+bandwidth limits, congestion queueing, link outages, maximum packet sizes and
+lifetimes, random and burst packet loss, packet duplication and payload
+corruption, packet reordering, and bounded queues. A fixed seed makes a
+simulation reproducible.
 
 ## Quick start
 
@@ -63,6 +64,8 @@ conn, err := lossyconn.NewWithConfig(lossyconn.Config{
 	BandwidthBytesPerSec: 2 * 1024 * 1024,
 	MaxPacketSize:        1200,
 	PacketLifetime:       2 * time.Second,
+	QueueDelayPerPacket:  2 * time.Millisecond,
+	MaxQueueDelay:        100 * time.Millisecond,
 	RandomLossRate:       0.01,
 	BurstLossRate:        0.002,
 	BurstLength:          3,
@@ -91,6 +94,10 @@ defer conn.Close()
 - `PacketLifetime`: maximum time a packet may remain in transit; zero disables
   expiration. Expired packets are discarded and counted by the receiving
   connection.
+- `QueueDelayPerPacket` and `MaxQueueDelay`: add delay based on the number of
+  packets already waiting in the outgoing queue, capped at `MaxQueueDelay`.
+  `MaxQueueDelay` must be positive when queue delay is enabled. Both values are
+  zero by default.
 - `RandomLossRate`: independent packet-loss probability from 0 to 1.
 - `BurstLossRate` and `BurstLength`: probability and length of consecutive
   packet-loss bursts.
@@ -112,6 +119,10 @@ behavior of sending a datagram over a lossy network. Queue overflow, unreachable
 destinations, and expired write deadlines return errors. Read deadlines return
 an error that implements `net.Error`.
 
+Use `SetLinkState(false)` to simulate an outgoing link outage and
+`SetLinkState(true)` to restore it. Writes during an outage still succeed, but
+the packets are discarded and counted in `DropLinkDown`.
+
 ## Observe simulation statistics
 
 `Stats` returns a per-connection snapshot. Receive-side counters include queue
@@ -119,9 +130,10 @@ and expired-packet drops. `ResetStats` clears the counters:
 
 ```go
 stats := conn.Stats()
-fmt.Printf("sent=%d received=%d duplicated=%d corrupted=%d random drops=%d oversized drops=%d expired drops=%d receive queue drops=%d send queue drops=%d\n",
+fmt.Printf("sent=%d received=%d duplicated=%d corrupted=%d random drops=%d oversized drops=%d expired drops=%d link-down drops=%d queue-delayed=%d receive queue drops=%d send queue drops=%d\n",
 	stats.SentPackets, stats.RecvPackets, stats.DuplicatedPackets, stats.CorruptedPackets,
-	stats.DropRandom, stats.DropOversize, stats.DropExpired, stats.DropQueue, stats.DropPendingQueue)
+	stats.DropRandom, stats.DropOversize, stats.DropExpired, stats.DropLinkDown,
+	stats.QueueDelayedPackets, stats.DropQueue, stats.DropPendingQueue)
 conn.ResetStats()
 ```
 

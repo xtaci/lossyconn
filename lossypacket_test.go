@@ -39,6 +39,15 @@ func TestNewLossyConnInvalidInput(t *testing.T) {
 	if _, err := NewWithConfig(Config{PacketLifetime: -time.Nanosecond}); err == nil {
 		t.Fatal("expected invalid packet lifetime")
 	}
+	if _, err := NewWithConfig(Config{QueueDelayPerPacket: time.Millisecond}); err == nil {
+		t.Fatal("expected queue delay without maximum to be invalid")
+	}
+	if _, err := NewWithConfig(Config{QueueDelayPerPacket: -time.Nanosecond, MaxQueueDelay: time.Second}); err == nil {
+		t.Fatal("expected invalid queue delay")
+	}
+	if _, err := NewWithConfig(Config{QueueDelayPerPacket: time.Millisecond, MaxQueueDelay: -time.Second}); err == nil {
+		t.Fatal("expected invalid maximum queue delay")
+	}
 }
 
 func TestSetDelayDeviationValidation(t *testing.T) {
@@ -59,11 +68,11 @@ func TestSetDelayDeviationValidation(t *testing.T) {
 }
 
 func TestNewLossyPacketConnCompatibility(t *testing.T) {
-	left, err := NewLossyPacketConn(0.1, 10)
+	left, err := NewLossyPacketConn(0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	right, err := NewLossyPacketConn(0.1, 10)
+	right, err := NewLossyPacketConn(0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,6 +327,107 @@ func TestPacketLifetimeExpiresInTransit(t *testing.T) {
 	right.ResetStats()
 	if got := right.Stats(); got.DropExpired != 0 {
 		t.Fatalf("expected expired-drop stats to reset, got %+v", got)
+	}
+}
+
+func TestLinkDownAndRecovery(t *testing.T) {
+	left, err := NewWithConfig(Config{DelayDeviation: 0, Seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer left.Close()
+
+	right, err := NewWithConfig(Config{Seed: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer right.Close()
+
+	left.SetLinkState(false)
+	if n, err := left.WriteTo([]byte("dropped"), right.LocalAddr()); err != nil || n != len("dropped") {
+		t.Fatalf("write while link down = %d, %v; want successful write", n, err)
+	}
+	left.SetLinkState(true)
+	if n, err := left.WriteTo([]byte("received"), right.LocalAddr()); err != nil || n != len("received") {
+		t.Fatalf("write after link recovery = %d, %v; want successful write", n, err)
+	}
+
+	if err := right.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	n, _, err := right.ReadFrom(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != "received" {
+		t.Fatalf("unexpected delivered payload: %q", buf[:n])
+	}
+	if _, _, err := right.ReadFrom(buf); !isTimeout(err) {
+		t.Fatalf("expected packet sent during outage to be dropped, got %v", err)
+	}
+
+	stats := left.Stats()
+	if stats.DropLinkDown != 1 || stats.SentPackets != 2 || stats.SentBytes != uint64(len("dropped")+len("received")) {
+		t.Fatalf("unexpected sender stats after link recovery: %+v", stats)
+	}
+	left.ResetStats()
+	if stats := left.Stats(); stats.DropLinkDown != 0 {
+		t.Fatalf("expected link-down stats to reset, got %+v", stats)
+	}
+}
+
+func TestCongestionQueueDelayAndCap(t *testing.T) {
+	left, err := NewWithConfig(Config{
+		Delay:               250 * time.Millisecond,
+		DelayDeviation:      0,
+		QueueDelayPerPacket: 30 * time.Millisecond,
+		MaxQueueDelay:       45 * time.Millisecond,
+		QueueSize:           8,
+		Seed:                1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer left.Close()
+
+	right, err := NewWithConfig(Config{QueueSize: 8, Seed: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer right.Close()
+
+	start := time.Now()
+	for i := 0; i < 3; i++ {
+		if _, err := left.WriteTo([]byte{byte(i)}, right.LocalAddr()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := right.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	for i := 0; i < 3; i++ {
+		if _, _, err := right.ReadFrom(buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed < 280*time.Millisecond {
+		t.Fatalf("congestion queue delay was not applied: elapsed=%v", elapsed)
+	}
+	if stats := left.Stats(); stats.QueueDelayedPackets == 0 {
+		t.Fatalf("expected queued packets to receive congestion delay: %+v", stats)
+	}
+
+	left.mu.Lock()
+	capped := left.queueDelayLocked(100)
+	left.mu.Unlock()
+	if capped != 45*time.Millisecond {
+		t.Fatalf("queue delay cap = %v, want %v", capped, 45*time.Millisecond)
+	}
+	left.ResetStats()
+	if stats := left.Stats(); stats.QueueDelayedPackets != 0 {
+		t.Fatalf("expected queue-delay stats to reset, got %+v", stats)
 	}
 }
 
