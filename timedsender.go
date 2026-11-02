@@ -15,13 +15,14 @@ type entry struct {
 // TimedSender delivers packets to connections at their scheduled times.
 // Call Close when the sender is no longer needed.
 type TimedSender struct {
-	entries    []entry
-	chNotify   chan struct{}
-	chStop     chan struct{}
-	chDone     chan struct{}
-	maxPending int
-	closed     bool
-	mu         sync.Mutex
+	entries       []entry
+	chNotify      chan struct{}
+	chStop        chan struct{}
+	chDone        chan struct{}
+	maxPending    int
+	closed        bool
+	pendingByConn map[*LossyConn]int
+	mu            sync.Mutex
 }
 
 func (h *TimedSender) Len() int           { return len(h.entries) }
@@ -43,10 +44,11 @@ func NewTimedSender() *TimedSender {
 
 func newTimedSender(maxPending int) *TimedSender {
 	dw := &TimedSender{
-		chNotify:   make(chan struct{}, 1),
-		chStop:     make(chan struct{}),
-		chDone:     make(chan struct{}),
-		maxPending: maxPending,
+		chNotify:      make(chan struct{}, 1),
+		chStop:        make(chan struct{}),
+		chDone:        make(chan struct{}),
+		maxPending:    maxPending,
+		pendingByConn: make(map[*LossyConn]int),
 	}
 	go dw.sendLoop()
 	return dw
@@ -78,6 +80,7 @@ func (h *TimedSender) trySendBatch(conn *LossyConn, packets []Packet, delay time
 	for _, packet := range packets {
 		heap.Push(h, entry{ts, packet, conn})
 	}
+	h.pendingByConn[conn] += len(packets)
 	h.mu.Unlock()
 	if len(packets) > 0 {
 		h.notify()
@@ -85,10 +88,10 @@ func (h *TimedSender) trySendBatch(conn *LossyConn, packets []Packet, delay time
 	return true
 }
 
-func (h *TimedSender) pending() int {
+func (h *TimedSender) pendingFor(conn *LossyConn) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.Len()
+	return h.pendingByConn[conn]
 }
 
 // Close stops the sender and discards packets that have not yet been delivered.
@@ -98,6 +101,7 @@ func (h *TimedSender) Close() error {
 	if !h.closed {
 		h.closed = true
 		h.entries = nil
+		h.pendingByConn = make(map[*LossyConn]int)
 		close(h.chStop)
 	}
 	h.mu.Unlock()
@@ -122,6 +126,10 @@ func (h *TimedSender) sendLoop() {
 		hasEntries := h.Len() > 0
 		if h.Len() > 0 && !time.Now().Before(h.entries[0].ts) {
 			entry := heap.Pop(h).(entry)
+			h.pendingByConn[entry.conn]--
+			if h.pendingByConn[entry.conn] == 0 {
+				delete(h.pendingByConn, entry.conn)
+			}
 			h.mu.Unlock()
 			entry.conn.receivePacket(entry.packet)
 			continue

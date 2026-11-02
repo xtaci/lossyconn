@@ -2,7 +2,8 @@
 //
 // It supports configurable delay, bandwidth limits, packet loss, packet size
 // and lifetime limits, duplication, corruption, reordering, and bounded queues
-// for network testing.
+// for network testing. Outgoing profiles can be configured and scheduled per
+// destination.
 package lossyconn
 
 import (
@@ -13,6 +14,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -88,6 +90,27 @@ type Config struct {
 	Seed int64
 }
 
+// LinkProfile describes the outgoing link to one peer. Config contains the
+// link behavior; connection-wide queue limits and seed are ignored.
+type LinkProfile struct {
+	Config Config
+	Up     bool
+}
+
+type scheduledLinkProfile struct {
+	at      time.Time
+	profile LinkProfile
+}
+
+type peerLink struct {
+	profile   LinkProfile
+	explicit  bool
+	rng       *rand.Rand
+	nextSend  time.Time
+	burstLeft int
+	schedule  []scheduledLinkProfile
+}
+
 // Stats is a snapshot of a connection's packet, byte, loss, and delay counters.
 type Stats struct {
 	// Packets discarded by independent random loss.
@@ -133,25 +156,21 @@ type LossyConn struct {
 
 	cfg Config
 
-	rx   []Packet // incoming packets
-	addr net.Addr // local address
+	rx    []Packet // incoming packets
+	addr  net.Addr // local address
+	peers map[string]*peerLink
 
 	rdDeadLine      atomic.Value  // read deadline
 	wtDeadLine      atomic.Value  // write deadline
 	chNotifyReaders chan struct{} // notify incoming packets
 	chDeadline      chan struct{} // notify blocked readers about deadline changes
 
-	rng *rand.Rand
-
 	// timed sender
 	sender *TimedSender
-	// serialization state for bandwidth shaping
-	nextSend time.Time
 	// compatibility delay deviation override in milliseconds
-	deviation atomic.Value
-	// burst state
-	burstRemain int
-	linkUp      bool
+	deviation    atomic.Value
+	linkUp       bool
+	nextPeerSeed int64
 
 	// stats on this connection
 	sDropRandom       uint64
@@ -198,53 +217,12 @@ func NewLossyPacketConn(loss float64, delay int) (*LossyConn, error) {
 // limits return an error. Non-positive receive queue limits and zero outgoing
 // limits select the default capacity of 4096 packets.
 func NewWithConfig(cfg Config) (*LossyConn, error) {
-	if cfg.Delay < 0 {
-		return nil, errors.New("delay must be >= 0")
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
 	}
-	if cfg.MaxPacketSize < 0 {
-		return nil, errors.New("maximum packet size must be >= 0")
-	}
-	if cfg.PacketLifetime < 0 {
-		return nil, errors.New("packet lifetime must be >= 0")
-	}
-	if cfg.QueueDelayPerPacket < 0 {
-		return nil, errors.New("queue delay per packet must be >= 0")
-	}
-	if cfg.MaxQueueDelay < 0 {
-		return nil, errors.New("maximum queue delay must be >= 0")
-	}
-	if cfg.QueueDelayPerPacket > 0 && cfg.MaxQueueDelay == 0 {
-		return nil, errors.New("maximum queue delay must be > 0 when queue delay is enabled")
-	}
-	if math.IsNaN(cfg.DelayDeviation) || math.IsInf(cfg.DelayDeviation, 0) || cfg.DelayDeviation < 0 {
-		return nil, errors.New("delay deviation must be finite and >= 0")
-	}
-	if math.IsNaN(cfg.RandomLossRate) || cfg.RandomLossRate < 0 || cfg.RandomLossRate > 1 {
-		return nil, errors.New("random loss rate must be in [0,1]")
-	}
-	if math.IsNaN(cfg.BurstLossRate) || cfg.BurstLossRate < 0 || cfg.BurstLossRate > 1 {
-		return nil, errors.New("burst loss rate must be in [0,1]")
-	}
-	if cfg.BurstLength < 0 {
-		return nil, errors.New("burst length must be >= 0")
-	}
-	if math.IsNaN(cfg.DuplicateRate) || cfg.DuplicateRate < 0 || cfg.DuplicateRate > 1 {
-		return nil, errors.New("duplicate rate must be in [0,1]")
-	}
-	if math.IsNaN(cfg.CorruptionRate) || cfg.CorruptionRate < 0 || cfg.CorruptionRate > 1 {
-		return nil, errors.New("corruption rate must be in [0,1]")
-	}
-	if math.IsNaN(cfg.ReorderRate) || cfg.ReorderRate < 0 || cfg.ReorderRate > 1 {
-		return nil, errors.New("reorder rate must be in [0,1]")
-	}
-	if cfg.MaxReorderDelay < 0 {
-		return nil, errors.New("max reorder delay must be >= 0")
-	}
+
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = 4096
-	}
-	if cfg.MaxPendingPackets < 0 {
-		return nil, errors.New("maximum pending packets must be >= 0")
 	}
 	if cfg.MaxPendingPackets == 0 {
 		cfg.MaxPendingPackets = 4096
@@ -256,16 +234,66 @@ func NewWithConfig(cfg Config) (*LossyConn, error) {
 	conn := new(LossyConn)
 	conn.cfg = cfg
 	conn.linkUp = true
+	conn.peers = make(map[string]*peerLink)
+	conn.nextPeerSeed = cfg.Seed
 	conn.chNotifyReaders = make(chan struct{}, 1)
 	conn.chDeadline = make(chan struct{}, 1)
 	conn.die = make(chan struct{})
 	conn.addr = NewAddress()
 	conn.deviation.Store(cfg.DelayDeviation)
 	conn.sender = newTimedSender(cfg.MaxPendingPackets)
-	conn.rng = rand.New(rand.NewSource(cfg.Seed))
 	conn.rx = make([]Packet, 0, cfg.QueueSize)
 	defaultConnectionManager.Set(conn)
 	return conn, nil
+}
+
+func validateConfig(cfg Config) error {
+	if cfg.Delay < 0 {
+		return errors.New("delay must be >= 0")
+	}
+	if cfg.MaxPacketSize < 0 {
+		return errors.New("maximum packet size must be >= 0")
+	}
+	if cfg.PacketLifetime < 0 {
+		return errors.New("packet lifetime must be >= 0")
+	}
+	if cfg.QueueDelayPerPacket < 0 {
+		return errors.New("queue delay per packet must be >= 0")
+	}
+	if cfg.MaxQueueDelay < 0 {
+		return errors.New("maximum queue delay must be >= 0")
+	}
+	if cfg.QueueDelayPerPacket > 0 && cfg.MaxQueueDelay == 0 {
+		return errors.New("maximum queue delay must be > 0 when queue delay is enabled")
+	}
+	if math.IsNaN(cfg.DelayDeviation) || math.IsInf(cfg.DelayDeviation, 0) || cfg.DelayDeviation < 0 {
+		return errors.New("delay deviation must be finite and >= 0")
+	}
+	if math.IsNaN(cfg.RandomLossRate) || cfg.RandomLossRate < 0 || cfg.RandomLossRate > 1 {
+		return errors.New("random loss rate must be in [0,1]")
+	}
+	if math.IsNaN(cfg.BurstLossRate) || cfg.BurstLossRate < 0 || cfg.BurstLossRate > 1 {
+		return errors.New("burst loss rate must be in [0,1]")
+	}
+	if cfg.BurstLength < 0 {
+		return errors.New("burst length must be >= 0")
+	}
+	if math.IsNaN(cfg.DuplicateRate) || cfg.DuplicateRate < 0 || cfg.DuplicateRate > 1 {
+		return errors.New("duplicate rate must be in [0,1]")
+	}
+	if math.IsNaN(cfg.CorruptionRate) || cfg.CorruptionRate < 0 || cfg.CorruptionRate > 1 {
+		return errors.New("corruption rate must be in [0,1]")
+	}
+	if math.IsNaN(cfg.ReorderRate) || cfg.ReorderRate < 0 || cfg.ReorderRate > 1 {
+		return errors.New("reorder rate must be in [0,1]")
+	}
+	if cfg.MaxReorderDelay < 0 {
+		return errors.New("max reorder delay must be >= 0")
+	}
+	if cfg.MaxPendingPackets < 0 {
+		return errors.New("maximum pending packets must be >= 0")
+	}
+	return nil
 }
 
 // SetDelayDeviation sets the delay variation's standard deviation in milliseconds.
@@ -276,6 +304,115 @@ func (conn *LossyConn) SetDelayDeviation(deviation float64) error {
 	}
 	conn.deviation.Store(deviation)
 	return nil
+}
+
+// SetPeerProfile sets the outgoing link profile for addr. The profile replaces
+// the default link settings rather than merging with them.
+func (conn *LossyConn) SetPeerProfile(addr net.Addr, profile LinkProfile) error {
+	if err := validateLinkProfile(profile); err != nil {
+		return err
+	}
+	key, err := peerAddressKey(addr)
+	if err != nil {
+		return err
+	}
+
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	peer := conn.peerLocked(key)
+	peer.profile = profile
+	peer.explicit = true
+	return nil
+}
+
+// SchedulePeerProfile schedules a complete outgoing link profile for addr.
+// The profile takes effect for writes started at or after at.
+func (conn *LossyConn) SchedulePeerProfile(addr net.Addr, at time.Time, profile LinkProfile) error {
+	if at.IsZero() {
+		return errors.New("profile activation time must not be zero")
+	}
+	if err := validateLinkProfile(profile); err != nil {
+		return err
+	}
+	key, err := peerAddressKey(addr)
+	if err != nil {
+		return err
+	}
+
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	peer := conn.peerLocked(key)
+	index := sort.Search(len(peer.schedule), func(i int) bool {
+		return !peer.schedule[i].at.Before(at)
+	})
+	if index < len(peer.schedule) && peer.schedule[index].at.Equal(at) {
+		return errors.New("a profile is already scheduled at that time")
+	}
+	peer.schedule = append(peer.schedule, scheduledLinkProfile{})
+	copy(peer.schedule[index+1:], peer.schedule[index:])
+	peer.schedule[index] = scheduledLinkProfile{at: at, profile: profile}
+	return nil
+}
+
+func validateLinkProfile(profile LinkProfile) error {
+	cfg := profile.Config
+	cfg.MaxPendingPackets = 0
+	return validateConfig(cfg)
+}
+
+// SetPeerLinkState changes the up/down state of addr's outgoing link.
+// Scheduled profiles take precedence once their activation time is reached.
+func (conn *LossyConn) SetPeerLinkState(addr net.Addr, up bool) error {
+	key, err := peerAddressKey(addr)
+	if err != nil {
+		return err
+	}
+	conn.mu.Lock()
+	peer := conn.peerLocked(key)
+	peer.profile.Up = up
+	peer.explicit = true
+	conn.mu.Unlock()
+	return nil
+}
+
+// ClearPeerProfile removes the profile and scheduled changes for addr.
+func (conn *LossyConn) ClearPeerProfile(addr net.Addr) error {
+	key, err := peerAddressKey(addr)
+	if err != nil {
+		return err
+	}
+	conn.mu.Lock()
+	delete(conn.peers, key)
+	conn.mu.Unlock()
+	return nil
+}
+
+func peerAddressKey(addr net.Addr) (string, error) {
+	if addr == nil {
+		return "", errors.New("nil peer address")
+	}
+	key := addr.String()
+	if key == "" {
+		return "", errors.New("empty peer address")
+	}
+	return key, nil
+}
+
+func (conn *LossyConn) peerLocked(key string) *peerLink {
+	if peer := conn.peers[key]; peer != nil {
+		return peer
+	}
+	seed := conn.nextPeerSeed
+	conn.nextPeerSeed++
+	if conn.nextPeerSeed == 0 {
+		conn.nextPeerSeed = conn.cfg.Seed
+	}
+	peer := &peerLink{
+		profile: LinkProfile{Config: conn.cfg, Up: conn.linkUp},
+		rng:     rand.New(rand.NewSource(seed)),
+	}
+	conn.peers[key] = peer
+	return peer
 }
 
 func (conn *LossyConn) notifyReaders() {
@@ -401,21 +538,34 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 	if remote := defaultConnectionManager.Get(addr.String()); remote != nil {
 		conn.mu.Lock()
-		if !conn.linkUp {
+		peer := conn.peerLocked(addr.String())
+		profile := peer.profile
+		profileIndex := sort.Search(len(peer.schedule), func(i int) bool {
+			return peer.schedule[i].at.After(time.Now())
+		})
+		if profileIndex > 0 {
+			profile = peer.schedule[profileIndex-1].profile
+		}
+		cfg := profile.Config
+		deviation := cfg.DelayDeviation
+		if !peer.explicit && profileIndex == 0 {
+			deviation = conn.deviation.Load().(float64)
+		}
+		if !profile.Up {
 			conn.mu.Unlock()
 			atomic.AddUint64(&conn.sDropLinkDown, 1)
 			atomic.AddUint64(&conn.sSent, 1)
 			atomic.AddUint64(&conn.sBytesSent, uint64(len(p)))
 			return len(p), nil
 		}
-		if conn.cfg.MaxPacketSize > 0 && len(p) > conn.cfg.MaxPacketSize {
+		if cfg.MaxPacketSize > 0 && len(p) > cfg.MaxPacketSize {
 			conn.mu.Unlock()
 			atomic.AddUint64(&conn.sDropOversize, 1)
 			atomic.AddUint64(&conn.sSent, 1)
 			atomic.AddUint64(&conn.sBytesSent, uint64(len(p)))
 			return len(p), nil
 		}
-		if conn.shouldDropLocked() {
+		if conn.shouldDropLocked(peer, cfg) {
 			conn.mu.Unlock()
 			atomic.AddUint64(&conn.sSent, 1)
 			atomic.AddUint64(&conn.sBytesSent, uint64(len(p)))
@@ -424,35 +574,35 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 		now := time.Now()
 		start := now
-		if conn.nextSend.After(start) {
-			start = conn.nextSend
+		if peer.nextSend.After(start) {
+			start = peer.nextSend
 		}
 		serialization := time.Duration(0)
-		if conn.cfg.BandwidthBytesPerSec > 0 {
-			serialization = time.Duration((uint64(len(p))*uint64(time.Second) + conn.cfg.BandwidthBytesPerSec - 1) / conn.cfg.BandwidthBytesPerSec)
+		if cfg.BandwidthBytesPerSec > 0 {
+			serialization = time.Duration((uint64(len(p))*uint64(time.Second) + cfg.BandwidthBytesPerSec - 1) / cfg.BandwidthBytesPerSec)
 		}
 		nextSend := start.Add(serialization)
-		sendDelay := addDurationSaturated(nextSend.Sub(now), conn.baseDelayLocked())
-		queueDelay := conn.queueDelayLocked(conn.sender.pending())
+		sendDelay := addDurationSaturated(nextSend.Sub(now), conn.baseDelayLocked(peer, cfg, deviation))
+		queueDelay := conn.queueDelayLocked(cfg, conn.sender.pendingFor(remote))
 		sendDelay = addDurationSaturated(sendDelay, queueDelay)
-		reordered := conn.shouldReorderLocked()
+		reordered := conn.shouldReorderLocked(peer, cfg)
 		if reordered {
-			sendDelay = addDurationSaturated(sendDelay, conn.reorderDelayLocked())
+			sendDelay = addDurationSaturated(sendDelay, conn.reorderDelayLocked(peer, cfg))
 		}
 		delayed := sendDelay > 0
 
 		p1 := make([]byte, len(p))
 		copy(p1, p)
 		corrupted := false
-		if len(p1) > 0 && conn.cfg.CorruptionRate > 0 && conn.rng.Float64() < conn.cfg.CorruptionRate {
-			p1[conn.rng.Intn(len(p1))] ^= byte(1 << uint(conn.rng.Intn(8)))
+		if len(p1) > 0 && cfg.CorruptionRate > 0 && peer.rng.Float64() < cfg.CorruptionRate {
+			p1[peer.rng.Intn(len(p1))] ^= byte(1 << uint(peer.rng.Intn(8)))
 			corrupted = true
 		}
-		duplicated := conn.cfg.DuplicateRate > 0 && conn.rng.Float64() < conn.cfg.DuplicateRate
+		duplicated := cfg.DuplicateRate > 0 && peer.rng.Float64() < cfg.DuplicateRate
 		sentAt := time.Now()
 		expiresAt := time.Time{}
-		if conn.cfg.PacketLifetime > 0 {
-			expiresAt = sentAt.Add(conn.cfg.PacketLifetime)
+		if cfg.PacketLifetime > 0 {
+			expiresAt = sentAt.Add(cfg.PacketLifetime)
 		}
 		packets := []Packet{{addr: conn.LocalAddr(), payload: p1, ts: sentAt, expiresAt: expiresAt}}
 		if duplicated {
@@ -460,7 +610,7 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		}
 		queued := conn.sender.trySendBatch(remote, packets, sendDelay)
 		if queued {
-			conn.nextSend = nextSend
+			peer.nextSend = nextSend
 		}
 		conn.mu.Unlock()
 		if !queued {
@@ -490,20 +640,36 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	}
 }
 
-// SetLinkState enables or disables this connection's outgoing link.
-// Writes while disabled are accepted and counted, but packets are discarded.
+func addDurationSaturated(a, b time.Duration) time.Duration {
+	const maxDuration = time.Duration(1<<63 - 1)
+	if b > 0 && a > maxDuration-b {
+		return maxDuration
+	}
+	if b < 0 && a < time.Duration(-1<<63)-b {
+		return time.Duration(-1 << 63)
+	}
+	return a + b
+}
+
+// SetLinkState enables or disables the default outgoing link profile.
+// Explicit peer profiles are not affected.
 func (conn *LossyConn) SetLinkState(up bool) {
 	conn.mu.Lock()
 	conn.linkUp = up
+	for _, peer := range conn.peers {
+		if !peer.explicit {
+			peer.profile.Up = up
+		}
+	}
 	conn.mu.Unlock()
 }
 
-func (conn *LossyConn) queueDelayLocked(pending int) time.Duration {
-	if pending <= 0 || conn.cfg.QueueDelayPerPacket <= 0 {
+func (conn *LossyConn) queueDelayLocked(cfg Config, pending int) time.Duration {
+	if pending <= 0 || cfg.QueueDelayPerPacket <= 0 {
 		return 0
 	}
-	perPacket := conn.cfg.QueueDelayPerPacket
-	maxDelay := conn.cfg.MaxQueueDelay
+	perPacket := cfg.QueueDelayPerPacket
+	maxDelay := cfg.MaxQueueDelay
 	if int64(pending) > int64(maxDelay/perPacket) {
 		return maxDelay
 	}
@@ -514,15 +680,38 @@ func (conn *LossyConn) queueDelayLocked(pending int) time.Duration {
 	return delay
 }
 
-func addDurationSaturated(a, b time.Duration) time.Duration {
-	const maxDuration = time.Duration(1<<63 - 1)
-	if b > 0 && a > maxDuration-b {
-		return maxDuration
+func (conn *LossyConn) baseDelayLocked(peer *peerLink, cfg Config, deviation float64) time.Duration {
+	ms := float64(cfg.Delay/time.Millisecond) + deviation*peer.rng.NormFloat64()
+	if ms < 0 {
+		ms = 0
 	}
-	if b < 0 && a < time.Duration(-1<<63)-b {
-		return time.Duration(-1 << 63)
+	return time.Duration(ms * float64(time.Millisecond))
+}
+
+func (conn *LossyConn) shouldDropLocked(peer *peerLink, cfg Config) bool {
+	if peer.burstLeft > 0 {
+		peer.burstLeft--
+		atomic.AddUint64(&conn.sDropBurst, 1)
+		return true
 	}
-	return a + b
+	if cfg.BurstLossRate > 0 && cfg.BurstLength > 0 && peer.rng.Float64() < cfg.BurstLossRate {
+		peer.burstLeft = cfg.BurstLength - 1
+		atomic.AddUint64(&conn.sDropBurst, 1)
+		return true
+	}
+	if cfg.RandomLossRate > 0 && peer.rng.Float64() < cfg.RandomLossRate {
+		atomic.AddUint64(&conn.sDropRandom, 1)
+		return true
+	}
+	return false
+}
+
+func (conn *LossyConn) shouldReorderLocked(peer *peerLink, cfg Config) bool {
+	return cfg.ReorderRate > 0 && cfg.MaxReorderDelay > 0 && peer.rng.Float64() < cfg.ReorderRate
+}
+
+func (conn *LossyConn) reorderDelayLocked(peer *peerLink, cfg Config) time.Duration {
+	return time.Duration(peer.rng.Int63n(int64(cfg.MaxReorderDelay) + 1))
 }
 
 // Close closes the connection, unblocks blocked reads, stops its sender, and
@@ -659,41 +848,3 @@ type timeoutError string
 func (e timeoutError) Error() string   { return string(e) + ": i/o timeout" }
 func (e timeoutError) Timeout() bool   { return true }
 func (e timeoutError) Temporary() bool { return true }
-
-func (conn *LossyConn) shouldDropLocked() bool {
-	if conn.burstRemain > 0 {
-		conn.burstRemain--
-		atomic.AddUint64(&conn.sDropBurst, 1)
-		return true
-	}
-
-	if conn.cfg.BurstLossRate > 0 && conn.cfg.BurstLength > 0 && conn.rng.Float64() < conn.cfg.BurstLossRate {
-		conn.burstRemain = conn.cfg.BurstLength - 1
-		atomic.AddUint64(&conn.sDropBurst, 1)
-		return true
-	}
-
-	if conn.cfg.RandomLossRate > 0 && conn.rng.Float64() < conn.cfg.RandomLossRate {
-		atomic.AddUint64(&conn.sDropRandom, 1)
-		return true
-	}
-
-	return false
-}
-
-func (conn *LossyConn) baseDelayLocked() time.Duration {
-	stddev := conn.deviation.Load().(float64)
-	ms := float64(conn.cfg.Delay/time.Millisecond) + stddev*conn.rng.NormFloat64()
-	if ms < 0 {
-		ms = 0
-	}
-	return time.Duration(ms * float64(time.Millisecond))
-}
-
-func (conn *LossyConn) shouldReorderLocked() bool {
-	return conn.cfg.ReorderRate > 0 && conn.cfg.MaxReorderDelay > 0 && conn.rng.Float64() < conn.cfg.ReorderRate
-}
-
-func (conn *LossyConn) reorderDelayLocked() time.Duration {
-	return time.Duration(conn.rng.Int63n(int64(conn.cfg.MaxReorderDelay) + 1))
-}

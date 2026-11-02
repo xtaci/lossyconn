@@ -123,6 +123,34 @@ Use `SetLinkState(false)` to simulate an outgoing link outage and
 `SetLinkState(true)` to restore it. Writes during an outage still succeed, but
 the packets are discarded and counted in `DropLinkDown`.
 
+## Configure links per peer
+
+Each destination can have independent delay, bandwidth, loss, queue shaping,
+and link state. The profile's `Config` uses the same link settings documented
+above; receive/send queue limits and random seed remain connection-wide:
+
+```go
+if err := left.SetPeerProfile(right.LocalAddr(), lossyconn.LinkProfile{
+	Config: lossyconn.Config{
+		Delay:          80 * time.Millisecond,
+		DelayDeviation: 2,
+		RandomLossRate: 0.02,
+	},
+	Up: true,
+}); err != nil {
+	return err
+}
+```
+
+`SchedulePeerProfile` adds a complete profile that takes effect for writes
+started at or after a specified time. Schedule multiple profiles to model
+changing conditions such as congestion followed by recovery; each scheduled
+profile replaces, rather than merges with, the previous one. Schedule another
+profile with `Up: true` to restore a link after a simulated outage.
+`SetPeerLinkState` changes one peer's state immediately, and
+`ClearPeerProfile` returns it to the connection's default profile. Statistics
+are aggregated per connection.
+
 ## Observe simulation statistics
 
 `Stats` returns a per-connection snapshot. Receive-side counters include queue

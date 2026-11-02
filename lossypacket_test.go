@@ -377,6 +377,161 @@ func TestLinkDownAndRecovery(t *testing.T) {
 	}
 }
 
+func TestPeerProfilesAreIndependent(t *testing.T) {
+	left, err := NewWithConfig(Config{DelayDeviation: 0, Seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer left.Close()
+
+	slowPeer, err := NewWithConfig(Config{Seed: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer slowPeer.Close()
+	droppingPeer, err := NewWithConfig(Config{Seed: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer droppingPeer.Close()
+
+	if err := left.SetPeerProfile(slowPeer.LocalAddr(), LinkProfile{
+		Config: Config{Delay: 100 * time.Millisecond, DelayDeviation: 0},
+		Up:     true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := left.SetPeerProfile(droppingPeer.LocalAddr(), LinkProfile{
+		Config: Config{RandomLossRate: 1, DelayDeviation: 0},
+		Up:     true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := left.WriteTo([]byte("slow"), slowPeer.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := left.WriteTo([]byte("drop"), droppingPeer.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	if err := slowPeer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 8)
+	start := time.Now()
+	n, _, err := slowPeer.ReadFrom(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != "slow" || time.Since(start) < 70*time.Millisecond {
+		t.Fatalf("peer-specific delay was not applied: payload=%q elapsed=%v", buf[:n], time.Since(start))
+	}
+
+	if err := droppingPeer.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := droppingPeer.ReadFrom(buf); !isTimeout(err) {
+		t.Fatalf("expected packet loss for configured peer, got %v", err)
+	}
+
+	stats := left.Stats()
+	if stats.SentPackets != 2 || stats.DropRandom != 1 {
+		t.Fatalf("unexpected aggregate sender stats: %+v", stats)
+	}
+	if err := left.ClearPeerProfile(slowPeer.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := left.WriteTo([]byte("default"), slowPeer.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	if err := slowPeer.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := slowPeer.ReadFrom(buf); err != nil {
+		t.Fatalf("cleared profile should restore default link: %v", err)
+	}
+}
+
+func TestScheduledPeerProfiles(t *testing.T) {
+	left, err := NewWithConfig(Config{DelayDeviation: 0, Seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer left.Close()
+	right, err := NewWithConfig(Config{Seed: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer right.Close()
+
+	if err := left.SetPeerProfile(right.LocalAddr(), LinkProfile{
+		Config: Config{DelayDeviation: 0},
+		Up:     true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	downAt := now.Add(80 * time.Millisecond)
+	upAt := now.Add(180 * time.Millisecond)
+	if err := left.SchedulePeerProfile(right.LocalAddr(), upAt, LinkProfile{
+		Config: Config{Delay: 35 * time.Millisecond, DelayDeviation: 0},
+		Up:     true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := left.SchedulePeerProfile(right.LocalAddr(), downAt, LinkProfile{
+		Config: Config{DelayDeviation: 0},
+		Up:     false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := left.SchedulePeerProfile(right.LocalAddr(), downAt, LinkProfile{
+		Config: Config{DelayDeviation: 0},
+		Up:     true,
+	}); err == nil {
+		t.Fatal("expected duplicate schedule time to be rejected")
+	}
+	if err := left.SchedulePeerProfile(nil, now, LinkProfile{Up: true}); err == nil {
+		t.Fatal("expected nil peer address to be rejected")
+	}
+
+	if _, err := left.WriteTo([]byte("before"), right.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Until(downAt) + 10*time.Millisecond)
+	if _, err := left.WriteTo([]byte("during"), right.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Until(upAt) + 10*time.Millisecond)
+	if _, err := left.WriteTo([]byte("after"), right.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := right.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	for i, want := range []string{"before", "after"} {
+		start := time.Now()
+		n, _, err := right.ReadFrom(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(buf[:n]) != want {
+			t.Fatalf("got packet %q, want %q", buf[:n], want)
+		}
+		if i == 1 && time.Since(start) < 25*time.Millisecond {
+			t.Fatalf("scheduled recovery delay was not applied: elapsed=%v", time.Since(start))
+		}
+	}
+	if _, _, err := right.ReadFrom(buf); !isTimeout(err) {
+		t.Fatalf("expected packet scheduled during outage to be dropped, got %v", err)
+	}
+	if stats := left.Stats(); stats.DropLinkDown != 1 || stats.SentPackets != 3 {
+		t.Fatalf("unexpected scheduled-link stats: %+v", stats)
+	}
+}
+
 func TestCongestionQueueDelayAndCap(t *testing.T) {
 	left, err := NewWithConfig(Config{
 		Delay:               250 * time.Millisecond,
@@ -420,7 +575,7 @@ func TestCongestionQueueDelayAndCap(t *testing.T) {
 	}
 
 	left.mu.Lock()
-	capped := left.queueDelayLocked(100)
+	capped := left.queueDelayLocked(left.cfg, 100)
 	left.mu.Unlock()
 	if capped != 45*time.Millisecond {
 		t.Fatalf("queue delay cap = %v, want %v", capped, 45*time.Millisecond)
