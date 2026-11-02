@@ -1,7 +1,8 @@
 // Package lossyconn provides an in-memory packet connection simulator.
 //
-// It supports configurable delay, bandwidth limits, packet loss, reordering,
-// and bounded receive and send queues for network testing.
+// It supports configurable delay, bandwidth limits, packet loss, packet size
+// and lifetime limits, duplication, corruption, reordering, and bounded queues
+// for network testing.
 package lossyconn
 
 import (
@@ -43,9 +44,10 @@ func (addr *Address) String() string {
 
 // Packet is a payload scheduled for delivery to a simulated connection.
 type Packet struct {
-	addr    net.Addr
-	payload []byte
-	ts      time.Time
+	addr      net.Addr
+	payload   []byte
+	ts        time.Time
+	expiresAt time.Time
 }
 
 // Config controls link simulation behavior.
@@ -56,12 +58,20 @@ type Config struct {
 	DelayDeviation float64
 	// Maximum outgoing bandwidth in bytes per second. Zero disables shaping.
 	BandwidthBytesPerSec uint64
+	// Maximum outgoing payload size in bytes. Zero disables the limit.
+	MaxPacketSize int
+	// Maximum time a packet may remain in transit. Zero disables expiration.
+	PacketLifetime time.Duration
 	// Probability of independently dropping each outgoing packet, in [0, 1].
 	RandomLossRate float64
 	// Probability of starting a burst-loss event for an outgoing packet, in [0, 1].
 	BurstLossRate float64
 	// Number of consecutive packets dropped when a burst-loss event starts.
 	BurstLength int
+	// Probability of duplicating an outgoing packet, in [0, 1].
+	DuplicateRate float64
+	// Probability of corrupting an outgoing packet payload, in [0, 1].
+	CorruptionRate float64
 	// Probability of adding an extra delay to an outgoing packet, in [0, 1].
 	ReorderRate float64
 	// Maximum extra delay used when reordering a packet.
@@ -82,6 +92,14 @@ type Stats struct {
 	DropBurst uint64
 	// Packets discarded because the receive queue was full.
 	DropQueue uint64
+	// Packets discarded because their payload exceeded MaxPacketSize.
+	DropOversize uint64
+	// Packets discarded after their configured lifetime elapsed in transit.
+	DropExpired uint64
+	// Additional packet copies scheduled by simulated duplication.
+	DuplicatedPackets uint64
+	// Accepted outgoing packets whose payload was changed by simulated corruption.
+	CorruptedPackets uint64
 	// Writes rejected because the outgoing queue was full or its sender was closed.
 	DropPendingQueue uint64
 	// Packets accepted by WriteTo, including simulated losses.
@@ -130,6 +148,10 @@ type LossyConn struct {
 	sDropRandom       uint64
 	sDropBurst        uint64
 	sDropQueue        uint64
+	sDropOversize     uint64
+	sDropExpired      uint64
+	sDuplicated       uint64
+	sCorrupted        uint64
 	sDropPendingQueue uint64
 	sReordered        uint64
 	sDelayedSend      uint64
@@ -161,12 +183,18 @@ func NewLossyPacketConn(loss float64, delay int) (*LossyConn, error) {
 }
 
 // NewWithConfig creates a configurable lossy packet connection. Invalid
-// probabilities, negative delays, and negative outgoing queue limits return an
-// error. Non-positive receive queue limits and zero outgoing limits select the
-// default capacity of 4096 packets.
+// probabilities, negative delay and packet limits, and negative outgoing queue
+// limits return an error. Non-positive receive queue limits and zero outgoing
+// limits select the default capacity of 4096 packets.
 func NewWithConfig(cfg Config) (*LossyConn, error) {
 	if cfg.Delay < 0 {
 		return nil, errors.New("delay must be >= 0")
+	}
+	if cfg.MaxPacketSize < 0 {
+		return nil, errors.New("maximum packet size must be >= 0")
+	}
+	if cfg.PacketLifetime < 0 {
+		return nil, errors.New("packet lifetime must be >= 0")
 	}
 	if math.IsNaN(cfg.DelayDeviation) || math.IsInf(cfg.DelayDeviation, 0) || cfg.DelayDeviation < 0 {
 		return nil, errors.New("delay deviation must be finite and >= 0")
@@ -179,6 +207,12 @@ func NewWithConfig(cfg Config) (*LossyConn, error) {
 	}
 	if cfg.BurstLength < 0 {
 		return nil, errors.New("burst length must be >= 0")
+	}
+	if math.IsNaN(cfg.DuplicateRate) || cfg.DuplicateRate < 0 || cfg.DuplicateRate > 1 {
+		return nil, errors.New("duplicate rate must be in [0,1]")
+	}
+	if math.IsNaN(cfg.CorruptionRate) || cfg.CorruptionRate < 0 || cfg.CorruptionRate > 1 {
+		return nil, errors.New("corruption rate must be in [0,1]")
 	}
 	if math.IsNaN(cfg.ReorderRate) || cfg.ReorderRate < 0 || cfg.ReorderRate > 1 {
 		return nil, errors.New("reorder rate must be in [0,1]")
@@ -232,6 +266,11 @@ func (conn *LossyConn) notifyReaders() {
 
 // receivePacket queues a delivered packet unless the connection is closed or full.
 func (conn *LossyConn) receivePacket(packet Packet) {
+	if !packet.expiresAt.IsZero() && !time.Now().Before(packet.expiresAt) {
+		atomic.AddUint64(&conn.sDropExpired, 1)
+		return
+	}
+
 	conn.mu.Lock()
 	select {
 	case <-conn.die:
@@ -340,6 +379,13 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	}
 
 	if remote := defaultConnectionManager.Get(addr.String()); remote != nil {
+		if conn.cfg.MaxPacketSize > 0 && len(p) > conn.cfg.MaxPacketSize {
+			atomic.AddUint64(&conn.sDropOversize, 1)
+			atomic.AddUint64(&conn.sSent, 1)
+			atomic.AddUint64(&conn.sBytesSent, uint64(len(p)))
+			return len(p), nil
+		}
+
 		conn.mu.Lock()
 		if conn.shouldDropLocked() {
 			conn.mu.Unlock()
@@ -367,7 +413,22 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 		p1 := make([]byte, len(p))
 		copy(p1, p)
-		queued := conn.sender.trySend(remote, Packet{conn.LocalAddr(), p1, time.Now()}, sendDelay)
+		corrupted := false
+		if len(p1) > 0 && conn.cfg.CorruptionRate > 0 && conn.rng.Float64() < conn.cfg.CorruptionRate {
+			p1[conn.rng.Intn(len(p1))] ^= byte(1 << uint(conn.rng.Intn(8)))
+			corrupted = true
+		}
+		duplicated := conn.cfg.DuplicateRate > 0 && conn.rng.Float64() < conn.cfg.DuplicateRate
+		sentAt := time.Now()
+		expiresAt := time.Time{}
+		if conn.cfg.PacketLifetime > 0 {
+			expiresAt = sentAt.Add(conn.cfg.PacketLifetime)
+		}
+		packets := []Packet{{addr: conn.LocalAddr(), payload: p1, ts: sentAt, expiresAt: expiresAt}}
+		if duplicated {
+			packets = append(packets, Packet{addr: conn.LocalAddr(), payload: p1, ts: sentAt, expiresAt: expiresAt})
+		}
+		queued := conn.sender.trySendBatch(remote, packets, sendDelay)
 		if queued {
 			conn.nextSend = nextSend
 		}
@@ -381,6 +442,12 @@ func (conn *LossyConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		}
 		if delayed {
 			atomic.AddUint64(&conn.sDelayedSend, 1)
+		}
+		if duplicated {
+			atomic.AddUint64(&conn.sDuplicated, 1)
+		}
+		if corrupted {
+			atomic.AddUint64(&conn.sCorrupted, 1)
 		}
 		atomic.AddUint64(&conn.sSent, 1)
 		atomic.AddUint64(&conn.sBytesSent, uint64(len(p)))
@@ -454,11 +521,15 @@ func (conn *LossyConn) SetWriteDeadline(t time.Time) error {
 
 // String returns a summary of packet, byte, loss, and delay statistics.
 func (conn *LossyConn) String() string {
-	return fmt.Sprintf("packet dropped(random):%v dropped(burst):%v dropped(queue):%v dropped(pending queue):%v packet sent:%v packet received:%v tx bytes:%v rx bytes:%v reordered:%v delayed sends:%v max delay:%v",
+	return fmt.Sprintf("packet dropped(random):%v dropped(burst):%v dropped(queue):%v dropped(oversize):%v dropped(expired):%v dropped(pending queue):%v duplicated:%v corrupted:%v packet sent:%v packet received:%v tx bytes:%v rx bytes:%v reordered:%v delayed sends:%v max delay:%v",
 		atomic.LoadUint64(&conn.sDropRandom),
 		atomic.LoadUint64(&conn.sDropBurst),
 		atomic.LoadUint64(&conn.sDropQueue),
+		atomic.LoadUint64(&conn.sDropOversize),
+		atomic.LoadUint64(&conn.sDropExpired),
 		atomic.LoadUint64(&conn.sDropPendingQueue),
+		atomic.LoadUint64(&conn.sDuplicated),
+		atomic.LoadUint64(&conn.sCorrupted),
 		atomic.LoadUint64(&conn.sSent),
 		atomic.LoadUint64(&conn.sReceived),
 		atomic.LoadUint64(&conn.sBytesSent),
@@ -472,17 +543,21 @@ func (conn *LossyConn) String() string {
 // Stats returns a snapshot of the connection's counters.
 func (conn *LossyConn) Stats() Stats {
 	return Stats{
-		DropRandom:       atomic.LoadUint64(&conn.sDropRandom),
-		DropBurst:        atomic.LoadUint64(&conn.sDropBurst),
-		DropQueue:        atomic.LoadUint64(&conn.sDropQueue),
-		DropPendingQueue: atomic.LoadUint64(&conn.sDropPendingQueue),
-		SentPackets:      atomic.LoadUint64(&conn.sSent),
-		RecvPackets:      atomic.LoadUint64(&conn.sReceived),
-		SentBytes:        atomic.LoadUint64(&conn.sBytesSent),
-		RecvBytes:        atomic.LoadUint64(&conn.sBytesReceived),
-		MaxDelay:         time.Duration(atomic.LoadInt64(&conn.sMaxDelay)),
-		Reordered:        atomic.LoadUint64(&conn.sReordered),
-		DelayedSends:     atomic.LoadUint64(&conn.sDelayedSend),
+		DropRandom:        atomic.LoadUint64(&conn.sDropRandom),
+		DropBurst:         atomic.LoadUint64(&conn.sDropBurst),
+		DropQueue:         atomic.LoadUint64(&conn.sDropQueue),
+		DropOversize:      atomic.LoadUint64(&conn.sDropOversize),
+		DropExpired:       atomic.LoadUint64(&conn.sDropExpired),
+		DuplicatedPackets: atomic.LoadUint64(&conn.sDuplicated),
+		CorruptedPackets:  atomic.LoadUint64(&conn.sCorrupted),
+		DropPendingQueue:  atomic.LoadUint64(&conn.sDropPendingQueue),
+		SentPackets:       atomic.LoadUint64(&conn.sSent),
+		RecvPackets:       atomic.LoadUint64(&conn.sReceived),
+		SentBytes:         atomic.LoadUint64(&conn.sBytesSent),
+		RecvBytes:         atomic.LoadUint64(&conn.sBytesReceived),
+		MaxDelay:          time.Duration(atomic.LoadInt64(&conn.sMaxDelay)),
+		Reordered:         atomic.LoadUint64(&conn.sReordered),
+		DelayedSends:      atomic.LoadUint64(&conn.sDelayedSend),
 	}
 }
 
@@ -491,6 +566,10 @@ func (conn *LossyConn) ResetStats() {
 	atomic.StoreUint64(&conn.sDropRandom, 0)
 	atomic.StoreUint64(&conn.sDropBurst, 0)
 	atomic.StoreUint64(&conn.sDropQueue, 0)
+	atomic.StoreUint64(&conn.sDropOversize, 0)
+	atomic.StoreUint64(&conn.sDropExpired, 0)
+	atomic.StoreUint64(&conn.sDuplicated, 0)
+	atomic.StoreUint64(&conn.sCorrupted, 0)
 	atomic.StoreUint64(&conn.sDropPendingQueue, 0)
 	atomic.StoreUint64(&conn.sReordered, 0)
 	atomic.StoreUint64(&conn.sDelayedSend, 0)

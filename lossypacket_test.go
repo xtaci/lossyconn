@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"net"
-	"sync"
 	"testing"
 	"time"
 )
@@ -19,6 +18,12 @@ func TestNewLossyConnInvalidInput(t *testing.T) {
 	if _, err := NewWithConfig(Config{BurstLossRate: -0.1}); err == nil {
 		t.Fatal("expected invalid burst loss error")
 	}
+	if _, err := NewWithConfig(Config{DuplicateRate: 1.1}); err == nil {
+		t.Fatal("expected invalid duplicate rate error")
+	}
+	if _, err := NewWithConfig(Config{CorruptionRate: math.NaN()}); err == nil {
+		t.Fatal("expected invalid corruption rate error")
+	}
 	if _, err := NewWithConfig(Config{RandomLossRate: math.NaN()}); err == nil {
 		t.Fatal("expected invalid NaN loss error")
 	}
@@ -27,6 +32,12 @@ func TestNewLossyConnInvalidInput(t *testing.T) {
 	}
 	if _, err := NewWithConfig(Config{MaxPendingPackets: -1}); err == nil {
 		t.Fatal("expected invalid pending queue size")
+	}
+	if _, err := NewWithConfig(Config{MaxPacketSize: -1}); err == nil {
+		t.Fatal("expected invalid maximum packet size")
+	}
+	if _, err := NewWithConfig(Config{PacketLifetime: -time.Nanosecond}); err == nil {
+		t.Fatal("expected invalid packet lifetime")
 	}
 }
 
@@ -136,6 +147,213 @@ func TestBurstLossDropStats(t *testing.T) {
 	st := left.Stats()
 	if st.DropBurst < 3 {
 		t.Fatalf("expected burst drop stats, got %+v", st)
+	}
+}
+
+func TestPacketDuplicationAndCorruption(t *testing.T) {
+	left, err := NewWithConfig(Config{
+		DelayDeviation: 0,
+		DuplicateRate:  1,
+		CorruptionRate: 1,
+		Seed:           1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer left.Close()
+
+	right, err := NewWithConfig(Config{DelayDeviation: 0, QueueSize: 4, Seed: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer right.Close()
+
+	payload := []byte{0}
+	if _, err := left.WriteTo(payload, right.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := right.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	var received []byte
+	for i := 0; i < 2; i++ {
+		n, _, err := right.ReadFrom(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 || buf[0] == payload[0] {
+			t.Fatalf("expected corrupted payload, got %v", buf[:n])
+		}
+		received = append(received, buf[0])
+	}
+	if received[0] != received[1] {
+		t.Fatalf("duplicate payloads differ: %v", received)
+	}
+
+	leftStats := left.Stats()
+	rightStats := right.Stats()
+	if leftStats.SentPackets != 1 || leftStats.SentBytes != 1 ||
+		leftStats.DuplicatedPackets != 1 || leftStats.CorruptedPackets != 1 {
+		t.Fatalf("unexpected sender stats: %+v", leftStats)
+	}
+	if rightStats.RecvPackets != 2 || rightStats.RecvBytes != 2 {
+		t.Fatalf("unexpected receiver stats: %+v", rightStats)
+	}
+	left.ResetStats()
+	if stats := left.Stats(); stats.DuplicatedPackets != 0 || stats.CorruptedPackets != 0 {
+		t.Fatalf("expected duplication and corruption stats to reset, got %+v", stats)
+	}
+}
+
+func TestDuplicateRequiresRoomForBothCopies(t *testing.T) {
+	left, err := NewWithConfig(Config{
+		Delay:             time.Hour,
+		DelayDeviation:    0,
+		DuplicateRate:     1,
+		MaxPendingPackets: 1,
+		Seed:              1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer left.Close()
+
+	right, err := NewWithConfig(Config{Seed: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer right.Close()
+
+	if _, err := left.WriteTo([]byte("packet"), right.LocalAddr()); err == nil {
+		t.Fatal("expected outgoing queue overflow for atomic duplicate")
+	}
+	stats := left.Stats()
+	if stats.SentPackets != 0 || stats.DuplicatedPackets != 0 || stats.DropPendingQueue != 1 {
+		t.Fatalf("unexpected stats after rejected duplicate: %+v", stats)
+	}
+}
+
+func TestMaximumPacketSize(t *testing.T) {
+	left, err := NewWithConfig(Config{MaxPacketSize: 3, DelayDeviation: 0, Seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer left.Close()
+
+	right, err := NewWithConfig(Config{Seed: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer right.Close()
+
+	for _, payload := range [][]byte{{1, 2, 3}, {4, 5, 6, 7}} {
+		if n, err := left.WriteTo(payload, right.LocalAddr()); err != nil || n != len(payload) {
+			t.Fatalf("WriteTo(%v) = %d, %v; want %d, nil", payload, n, err, len(payload))
+		}
+	}
+	if err := right.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 8)
+	n, _, err := right.ReadFrom(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 || string(buf[:n]) != string([]byte{1, 2, 3}) {
+		t.Fatalf("unexpected delivered packet: %v", buf[:n])
+	}
+	if _, _, err := right.ReadFrom(buf); !isTimeout(err) {
+		t.Fatalf("expected oversized packet to be dropped, got %v", err)
+	}
+
+	stats := left.Stats()
+	if stats.SentPackets != 2 || stats.SentBytes != 7 || stats.DropOversize != 1 {
+		t.Fatalf("unexpected sender stats: %+v", stats)
+	}
+	if stats := right.Stats(); stats.RecvPackets != 1 || stats.RecvBytes != 3 {
+		t.Fatalf("unexpected receiver stats: %+v", stats)
+	}
+	left.ResetStats()
+	if stats := left.Stats(); stats.DropOversize != 0 {
+		t.Fatalf("expected oversized-drop stats to reset, got %+v", stats)
+	}
+}
+
+func TestPacketLifetimeExpiresInTransit(t *testing.T) {
+	left, err := NewWithConfig(Config{
+		Delay:          40 * time.Millisecond,
+		DelayDeviation: 0,
+		PacketLifetime: 10 * time.Millisecond,
+		Seed:           1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer left.Close()
+
+	right, err := NewWithConfig(Config{Seed: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer right.Close()
+
+	if n, err := left.WriteTo([]byte("expires"), right.LocalAddr()); err != nil || n != len("expires") {
+		t.Fatalf("WriteTo() = %d, %v; want %d, nil", n, err, len("expires"))
+	}
+	if err := right.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := right.ReadFrom(make([]byte, 16)); !isTimeout(err) {
+		t.Fatalf("expected expired packet to be dropped, got %v", err)
+	}
+
+	if got := right.Stats(); got.DropExpired != 1 || got.RecvPackets != 0 {
+		t.Fatalf("unexpected receiver stats for expired packet: %+v", got)
+	}
+	if got := left.Stats(); got.SentPackets != 1 || got.SentBytes != uint64(len("expires")) {
+		t.Fatalf("expired packet should count as a successful write: %+v", got)
+	}
+	right.ResetStats()
+	if got := right.Stats(); got.DropExpired != 0 {
+		t.Fatalf("expected expired-drop stats to reset, got %+v", got)
+	}
+}
+
+func TestReadFromTruncatesDatagram(t *testing.T) {
+	left, err := NewWithConfig(Config{DelayDeviation: 0, Seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer left.Close()
+
+	right, err := NewWithConfig(Config{Seed: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer right.Close()
+
+	payload := []byte("complete datagram")
+	if _, err := left.WriteTo(payload, right.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	if err := right.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4)
+	n, from, err := right.ReadFrom(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(buf) || string(buf) != string(payload[:len(buf)]) {
+		t.Fatalf("unexpected truncated datagram: n=%d payload=%q", n, buf[:n])
+	}
+	if from.String() != left.LocalAddr().String() {
+		t.Fatalf("unexpected source address: got=%q want=%q", from, left.LocalAddr())
+	}
+	if _, _, err := right.ReadFrom(buf); !isTimeout(err) {
+		t.Fatalf("expected datagram remainder to be discarded, got %v", err)
 	}
 }
 
@@ -521,47 +739,32 @@ func TestLongRunCounterConsistency(t *testing.T) {
 	}
 	defer right.Close()
 
-	var wg sync.WaitGroup
-	readErr := make(chan error, 1)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, 8)
-		for {
-			if err := right.SetReadDeadline(time.Now().Add(120 * time.Millisecond)); err != nil {
-				readErr <- err
-				return
-			}
-			if _, _, err := right.ReadFrom(buf); err != nil {
-				if isTimeout(err) {
-					return
-				}
-				readErr <- err
-				return
-			}
-		}
-	}()
-
 	for i := 0; i < totalPackets; i++ {
 		if _, err := left.WriteTo([]byte{byte(i)}, right.LocalAddr()); err != nil {
 			t.Fatal(err)
 		}
 	}
-	wg.Wait()
-	close(readErr)
-	for err := range readErr {
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
 
 	lst := left.Stats()
-	rst := right.Stats()
 	if lst.SentPackets != totalPackets {
 		t.Fatalf("unexpected sent count: got=%d want=%d", lst.SentPackets, totalPackets)
 	}
-	delivered := rst.RecvPackets + rst.DropQueue
 	dropped := lst.DropRandom + lst.DropBurst
+	wantDelivered := uint64(totalPackets) - dropped
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		rst := right.Stats()
+		if rst.RecvPackets+rst.DropQueue == wantDelivered {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("delivery counters did not settle: want=%d left=%+v right=%+v", wantDelivered, lst, rst)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	rst := right.Stats()
+	delivered := rst.RecvPackets + rst.DropQueue
 	if delivered+dropped != totalPackets {
 		t.Fatalf("counter mismatch: delivered=%d dropped=%d total=%d left=%+v right=%+v", delivered, dropped, totalPackets, lst, rst)
 	}

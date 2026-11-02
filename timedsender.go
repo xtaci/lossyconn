@@ -65,14 +65,23 @@ func (h *TimedSender) Send(conn *LossyConn, packet Packet, delay time.Duration) 
 }
 
 func (h *TimedSender) trySend(conn *LossyConn, packet Packet, delay time.Duration) bool {
+	return h.trySendBatch(conn, []Packet{packet}, delay)
+}
+
+func (h *TimedSender) trySendBatch(conn *LossyConn, packets []Packet, delay time.Duration) bool {
 	h.mu.Lock()
-	if h.closed || (h.maxPending > 0 && h.Len() >= h.maxPending) {
+	if h.closed || (h.maxPending > 0 && h.Len()+len(packets) > h.maxPending) {
 		h.mu.Unlock()
 		return false
 	}
-	heap.Push(h, entry{time.Now().Add(delay), packet, conn})
+	ts := time.Now().Add(delay)
+	for _, packet := range packets {
+		heap.Push(h, entry{ts, packet, conn})
+	}
 	h.mu.Unlock()
-	h.notify()
+	if len(packets) > 0 {
+		h.notify()
+	}
 	return true
 }
 

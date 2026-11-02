@@ -1,6 +1,6 @@
 # lossyconn
 
-[![GoDoc][1]][2] [![MIT licensed][3]][4] [![Coverage Status][5]][6]
+[![GoDoc][1]][2] [![MIT licensed][3]][4] [![Coverage Status][5]][6] [![Created at][7]][8]
 
 [1]: https://godoc.org/github.com/xtaci/lossyconn?status.svg
 [2]: https://godoc.org/github.com/xtaci/lossyconn
@@ -8,10 +8,13 @@
 [4]: LICENSE
 [5]: https://codecov.io/gh/xtaci/lossyconn/branch/master/graph/badge.svg
 [6]: https://codecov.io/gh/xtaci/lossyconn
+[7]: https://img.shields.io/github/created-at/xtaci/lossyconn
+[8]: https://github.com/xtaci/lossyconn
 
 `lossyconn` is an in-memory, packet-oriented network simulator for Go tests. It
 implements `net.PacketConn` and can simulate one-way delay, delay variation,
-bandwidth limits, random and burst packet loss, packet reordering, and bounded
+bandwidth limits, maximum packet sizes and lifetimes, random and burst packet
+loss, packet duplication and payload corruption, packet reordering, and bounded
 queues. A fixed seed makes a simulation reproducible.
 
 ## Quick start
@@ -58,9 +61,13 @@ conn, err := lossyconn.NewWithConfig(lossyconn.Config{
 	Delay:                50 * time.Millisecond,
 	DelayDeviation:       2, // standard deviation, in milliseconds
 	BandwidthBytesPerSec: 2 * 1024 * 1024,
+	MaxPacketSize:        1200,
+	PacketLifetime:       2 * time.Second,
 	RandomLossRate:       0.01,
 	BurstLossRate:        0.002,
 	BurstLength:          3,
+	DuplicateRate:        0.001,
+	CorruptionRate:       0.0001,
 	ReorderRate:          0.02,
 	MaxReorderDelay:      8 * time.Millisecond,
 	QueueSize:            4096,
@@ -79,9 +86,19 @@ defer conn.Close()
 - `DelayDeviation`: standard deviation of normally distributed delay variation,
   in milliseconds.
 - `BandwidthBytesPerSec`: maximum outgoing bandwidth; zero disables shaping.
+- `MaxPacketSize`: maximum outgoing payload size in bytes; zero disables the
+  limit. Larger packets are counted as sent but dropped before delivery.
+- `PacketLifetime`: maximum time a packet may remain in transit; zero disables
+  expiration. Expired packets are discarded and counted by the receiving
+  connection.
 - `RandomLossRate`: independent packet-loss probability from 0 to 1.
 - `BurstLossRate` and `BurstLength`: probability and length of consecutive
   packet-loss bursts.
+- `DuplicateRate`: probability of scheduling one additional copy of an outgoing
+  packet. Both copies are accepted or rejected together by the bounded send
+  queue.
+- `CorruptionRate`: probability of flipping one random payload bit in an
+  outgoing packet. Empty payloads are not corrupted.
 - `ReorderRate` and `MaxReorderDelay`: probability and maximum extra delay for
   reordering.
 - `QueueSize`: maximum number of received packets buffered per connection.
@@ -97,13 +114,14 @@ an error that implements `net.Error`.
 
 ## Observe simulation statistics
 
-`Stats` returns a per-connection snapshot. `ResetStats` clears the counters:
+`Stats` returns a per-connection snapshot. Receive-side counters include queue
+and expired-packet drops. `ResetStats` clears the counters:
 
 ```go
 stats := conn.Stats()
-fmt.Printf("sent=%d received=%d random drops=%d receive queue drops=%d send queue drops=%d\n",
-	stats.SentPackets, stats.RecvPackets, stats.DropRandom, stats.DropQueue,
-	stats.DropPendingQueue)
+fmt.Printf("sent=%d received=%d duplicated=%d corrupted=%d random drops=%d oversized drops=%d expired drops=%d receive queue drops=%d send queue drops=%d\n",
+	stats.SentPackets, stats.RecvPackets, stats.DuplicatedPackets, stats.CorruptedPackets,
+	stats.DropRandom, stats.DropOversize, stats.DropExpired, stats.DropQueue, stats.DropPendingQueue)
 conn.ResetStats()
 ```
 
