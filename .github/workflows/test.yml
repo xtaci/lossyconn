@@ -6,9 +6,10 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os: [ubuntu-latest, macos-latest]
         go-version: ["1.13.x", "1.x"]
     steps:
       - uses: actions/checkout@v4
@@ -19,3 +20,16 @@ jobs:
       - run: go test -race ./...
       - run: go vet ./...
       - run: go test -run '^$' -bench . -benchmem ./...
+
+  test-freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          prepare: pkg install -y go
+          run: |
+            go test ./...
+            go test -race ./...
+            go vet ./...
+            go test -run '^$' -bench . -benchmem ./...
