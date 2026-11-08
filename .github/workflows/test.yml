@@ -8,9 +8,13 @@ jobs:
   test:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         go-version: ["1.13.x", "1.x"]
+        exclude:
+          - os: macos-latest
+            go-version: "1.13.x"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
